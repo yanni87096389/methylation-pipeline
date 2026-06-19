@@ -1,0 +1,1813 @@
+---
+title: "CRC-850K-Pipeline"
+author: "YC"
+date: "2026-06-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+  results = "hide",  
+  message = FALSE,   
+  warning = FALSE   
+)
+```
+
+## data preprocessing
+```{r standard beta value matrix and pd group information-ChAMP filtering}
+rm(list = ls())
+options(stringsAsFactors = F)
+require(GEOquery)
+require(Biobase)
+library("impute")
+library(ChAMP)
+library(data.table)
+
+eset <- getGEO("GSE199057",destdir = './',AnnotGPL = T,getGPL = F)
+## Modify this part when applying the pipeline to another dataset
+pD.all <- pData(eset[[1]])
+pD <- pD.all[,c(1,2)]
+names(pD) <- c("group", "ID")
+pD$group1 <- ifelse(
+  grepl("normal colon tissue from CRC patient",pD$group,ignore.case = T),
+  "NAT",
+  ifelse(grepl("normal colon tissue from non-CRC patient", pD$group,ignore.case = T),"healthy colon",
+         "Tumor"))
+pD <- pD[,-1]
+pD$group <-pD$group1
+pD <- pD[,-2]
+#⭐Check if the extracted groupings are correct
+check_df <- data.frame(Title = pD.all$title, Group = pD$group)
+#head(check_df, 10)
+#tail(check_df,10)
+table(pD$group)
+## Prepare beta value matrix
+#beta.m <- exprs(eset[[1]])#the easiest way
+beta.m <- fread("GSE199057_processed_methlyation_matrix.txt.gz",data.table = F)
+dim(beta.m)
+beta_cols <- grep("\\.AVG_Beta$", colnames(beta.m), value = TRUE)
+beta_sample_id <- sub("\\.AVG_Beta$", "", beta_cols)
+head(beta_sample_id)
+sample_map <- data.frame(
+  GSM = pD.all$geo_accession,
+  title = pD.all$title,
+  stringsAsFactors = FALSE
+)
+sample_map$SampleID <- sub(".*\\[([^]]+)\\].*", "\\1", sample_map$title)
+head(sample_map)
+idx <- match(beta_sample_id, sample_map$SampleID)
+
+beta_to_GSM <- data.frame(
+  beta_column = beta_cols,
+  SampleID = beta_sample_id,
+  GSM = sample_map$GSM[idx],
+  title = sample_map$title[idx],
+  stringsAsFactors = FALSE
+)
+
+head(beta_to_GSM)
+sum(is.na(beta_to_GSM$GSM))
+beta_to_GSM[is.na(beta_to_GSM$GSM), ]
+
+## In GSE199057, two technical replicates use hyphens in the processed matrix:
+##   T1003588-rep1
+##   T1003588-rep2
+## But GEO metadata title uses spaces:
+##   T1003588 rep1
+##   T1003588 rep2
+## Therefore, manually assign their GSM IDs.
+sample_map[grepl("T1003588", sample_map$title, ignore.case = TRUE),
+                       c("GSM", "SampleID", "title")]
+beta_to_GSM$GSM[beta_to_GSM$SampleID == "T1003588-rep1"] <- "GSM5963372"
+beta_to_GSM$title[beta_to_GSM$SampleID == "T1003588-rep1"] <- 
+  "colon tumor sample from CRC patient [T1003588 rep1]"
+
+beta_to_GSM$GSM[beta_to_GSM$SampleID == "T1003588-rep2"] <- "GSM5963373"
+beta_to_GSM$title[beta_to_GSM$SampleID == "T1003588-rep2"] <- 
+  "colon tumor sample from CRC patient [T1003588 rep2]"
+## Recheck unmatched samples after manual correction.
+sum(is.na(beta_to_GSM$GSM))
+beta_to_GSM[is.na(beta_to_GSM$GSM), ]
+
+## Plate-control samples are technical controls.
+## They should not be included in Tumor vs NAT / healthy_colon analysis.
+beta_to_GSM_clean <- beta_to_GSM[
+  !grepl("Plate-Control", beta_to_GSM$SampleID, ignore.case = TRUE),
+]
+## Confirm that all retained samples have GSM IDs.
+sum(is.na(beta_to_GSM_clean))
+
+## Extract only AVG_Beta columns and convert to a numeric matrix.
+beta <- as.matrix(beta.m[, beta_to_GSM_clean$beta_column, drop = FALSE])
+mode(beta) <- "numeric"
+rownames(beta) <- beta.m$TargetID## Set CpG probe IDs as row names.
+colnames(beta) <- beta_to_GSM_clean$GSM## Set GSM IDs as column names.
+dim(beta)#224 samples
+nrow(beta_to_GSM_clean)
+## Check which beta columns were removed.
+## These should be plate-control columns only.
+setdiff(beta_cols, beta_to_GSM_clean$beta_column)
+# It returns all unique elements that are present in x but not in y.
+range(beta, na.rm = TRUE)
+anyNA(beta)
+
+sum(is.na(beta))## Count missing beta values.
+mean(is.na(beta)) * 100## Calculate missing-value percentage.
+## Check whether missing values are concentrated in specific samples.
+na_per_sample <- colSums(is.na(beta))
+summary(na_per_sample)
+sort(na_per_sample, decreasing = TRUE)[1:10]
+na_rate_sample <- colMeans(is.na(beta)) * 100
+sort(na_rate_sample, decreasing = TRUE)[1:10]
+
+## Check whether missing values are concentrated in specific probes.
+na_per_probe <- rowSums(is.na(beta))
+summary(na_per_probe)
+sum(na_per_probe > 0)
+
+beta <- beta[rowSums(is.na(beta)) == 0, ]
+## Save the cleaned beta matrix as beta.m1 for downstream ChAMP analysis.
+beta.m1 <- beta
+## Final NA check.
+dim(beta.m1)
+# The beta signal matrix must not contain any NA values
+anyNA(beta.m1)
+
+head(rownames(beta.m1))
+head(colnames(beta.m1))
+
+## Identify samples that exist in pD but not in beta.m1.
+missing_in_beta <- setdiff(pD$ID, colnames(beta))
+missing_in_beta
+## Inspect these samples in the original GEO metadata.
+## In GSE199057, these should be plate-control samples.
+pD.all[pD.all$geo_accession %in% missing_in_beta, c("title", "geo_accession")]
+# Back up the data first to avoid recovery issues in case of accidental deletion
+pD.raw <- pD
+# Remove these 5 plate-control samples from pD-not present in the beta matrix.
+pD <- pD[!pD$ID %in% missing_in_beta, , drop = FALSE]
+# Check dimensions after deletion
+dim(pD)
+ncol(beta)
+nrow(pD)
+## Check whether beta.m1 and pD contain the same sample set.
+## setequal() ignores order.
+identical(rownames(pD),colnames(beta.m1))
+setequal(colnames(beta.m1), pD$ID)
+# Confirm that there are no duplicated sample names
+sum(duplicated(colnames(beta.m1)))
+sum(duplicated(pD$ID))
+
+# Reorder pD to match the column names of beta.m1
+pD <- pD[match(colnames(beta.m1), pD$ID), , drop = FALSE]
+
+# Set pD row names as GSM IDs.
+rownames(pD) <- pD$ID
+## Final strict alignment check.
+dim(beta.m1)
+dim(pD)
+## This must be TRUE before running champ.filter().
+identical(rownames(pD), colnames(beta.m1))
+## Check final group numbers.
+table(pD$group, useNA = "ifany")
+# Set group order
+pD$group <- factor(
+  pD$group,
+  levels = c("healthy colon", "NAT", "Tumor")
+)
+
+# Sort pD by group
+sample_order <- order(pD$group)
+
+pD <- pD[sample_order, , drop = FALSE]
+
+# Set rownames as GSM ID
+rownames(pD) <- pD$ID
+
+# Reorder beta matrix columns according to pD
+beta.m1 <- beta.m1[, rownames(pD), drop = FALSE]
+
+# Final check
+identical(rownames(pD), colnames(beta.m1))
+table(pD$group)
+## Run ChAMP filtering using the cleaned beta matrix and aligned pD.
+myLoad <- champ.filter(beta = beta.m1, pd = pD, arraytype = "EPIC")
+## Save the ChAMP object for downstream analysis.
+save(myLoad,file = 'step1-output.Rdata')
+
+# Both methods are designed to generate a ChAMP object
+# For all downstream analyses, simply use this myLoad variable
+#champ.filter() performs initial quality control:
+#(1).Filters out probes with low detection p-value.
+#(2).Removes probes with missing values.
+#(3).Filters sex chromosomes or SNP-associated probes if needed.
+#(4).The output myLoad is an object used for all downstream ChAMP analyses 
+##(normalization, DMP, DMR, pathway analysis).
+```
+
+## Quality control using PCA heatmap correlation heatmap
+```{r ChAMP normalisation & quality control}
+rm(list = ls())
+library("ChAMP")
+library("minfi")
+
+#load(file = 'step1-output.Rdata')
+# This is a time-consuming step.
+# Run it once, save the result, and then keep this block disabled.
+if(F){
+  load(file = 'step1-output.Rdata')
+  myNorm <- champ.norm(beta=myLoad$beta,arraytype="850K",cores=5)
+  dim(myNorm) 
+  pD=myLoad$pd
+  save(myNorm,pD,file = 'step2_champ_myNorm_2groups.Rdata')
+}
+load("step2_champ_myNorm_2groups.Rdata")
+
+## Step 2. Quality control plot 1: PCA plot
+# Convert beta matrix into a sample-by-CpG data frame.
+# Original myLoad$beta: rows = CpGs, columns = samples.
+# After transpose: rows = samples, columns = CpGs.
+dat=as.data.frame(t(beta_new))
+# Preview the first four rows and columns
+dat[1:4,1:4]
+# Load packages for PCA and visualization
+library(FactoMineR)
+library(factoextra) 
+# Perform PCA without plotting automatically
+dat.pca <- PCA(dat, graph = FALSE)
+Group <- pd_new$group
+# Generate PCA plot colored by group
+p_pca <- fviz_pca_ind(dat.pca,
+             geom.ind = "point", # show points only (nbut not "text")
+             col.ind = Group, # color by groups
+             palette = c("#00AFBB", "#E7B800","#FC4E07"),
+             addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups"
+)
+p_pca
+# Save PCA plot as PDF
+ggsave(
+  filename = "verificationPlots/Quality_Control_Plots/GSE199057_PCA_plot.pdf",
+  plot = p_pca,
+  width = 7,
+  height = 5
+)
+
+##Quality control plot 2: heatmap of top 1000 most variable CpGs
+library(pheatmap)
+Group <- pd_new$group
+# Calculate standard deviation for each CpG across samples,
+# sort CpGs by variability, and select the top 1000 most variable CpGs.
+# apply(myLoad$beta, 1, sd):
+#   1 means applying the function by row, i.e. by CpG.
+#   2 would mean applying the function by column, i.e. by sample.
+g <- names(tail(sort(apply(beta_new, 1, sd)), 1000)) 
+# Subset beta matrix to the top 1000 most variable CpGs
+n <- beta_new[g, ]
+# Create column annotation data frame for sample groups
+annotation_col = data.frame(row.names = colnames(n),
+                            Group = Group)
+
+# Draw heatmap of the top 1000 most variable CpGs
+pheatmap(n,
+         show_colnames =F,
+         show_rownames = F,
+         annotation_col= annotation_col,
+         scale = "row", #Standardize each CpG row to emphasize within-CpG #differences across samples
+         breaks = seq(-3,3,length.out = 100),## Limit color scale to -3 to 3; #values outside this range use extreme colors
+         cluster_cols = FALSE,
+         main = "Top 1000 most variable CpGs",
+         filename = "verificationPlots/Quality_Control_Plots/GSE199057_top1000_variable_CpGs_heatmap.png",
+         width = 8,
+         height = 7
+) 
+
+##Quality control plot 3: sample correlation heatmap
+# The within-group sample similarity should generally be higher
+# than between-group sample similarity.
+  beta.m <- beta_new
+  group_list <- pd_new$group
+# Rename beta matrix as exprSet for compatibility with common expression-analysis #workflow
+  exprSet=beta.m
+# Draw a simple sample correlation heatmap
+  pheatmap::pheatmap(cor(exprSet)) 
+  
+  colD=data.frame(group_list=group_list)
+  rownames(colD)=colnames(exprSet)
+# Draw a simple sample correlation heatmap
+  pheatmap::pheatmap(cor(exprSet),
+                     annotation_col = colD,
+                     show_rownames = F,
+                     cluster_cols = FALSE,
+                     filename = 'verificationPlots/Quality_Control_Plots/GSE199057_cor_all.png')
+  
+  
+# Select the top 500 CpGs with the highest median absolute deviation,
+# which represent highly variable CpGs across samples
+  exprSet=exprSet[names(sort(apply(exprSet, 1,mad),decreasing = T)[1:500]),]
+  dim(exprSet)
+  # M=cor(log2(exprSet+1)) 
+  M=cor(exprSet)
+  pheatmap::pheatmap(M,annotation_col = colD)
+  pheatmap::pheatmap(M,
+                     show_rownames = F,
+                     annotation_col = colD,
+                     cluster_cols = F,
+                     filename = 'verificationPlots/Quality_Control_Plots/GSE199057_cor_top500.png')
+
+## Additional QC plots using minfi-beta value density plot by sample
+  library(ggplot2)
+  
+  beta_for_plot <- beta_new
+  group_list <- pd_new$group
+  
+  names(group_list) <- rownames(pd_new)
+  group_list <- group_list[colnames(beta_for_plot)]
+# Set random seed for reproducibility
+  set.seed(123)
+  
+  sample_cpgs <- sample(
+    rownames(beta_for_plot),
+    size = min(50000, nrow(beta_for_plot))
+  )
+  
+  beta_sub <- beta_for_plot[sample_cpgs, ]
+  
+  density_df <- do.call(
+    rbind,
+    lapply(colnames(beta_sub), function(s) {
+      d <- density(beta_sub[, s], na.rm = TRUE, from = 0, to = 1)
+      data.frame(
+        Sample = s,
+        Beta = d$x,
+        Density = d$y,
+        Group = group_list[s]
+      )
+    })
+  )
+  
+  p_density <- ggplot(
+    density_df,
+    aes(x = Beta, y = Density, group = Sample, color = Group)
+  ) +
+    geom_line(alpha = 0.25) +
+    theme_bw() +
+    labs(
+      title = "Beta value density plot by sample",
+      x = "Beta value",
+      y = "Density"
+    )
+  
+  ggsave(
+    filename = "verificationPlots/Quality_Control_Plots/GSE199057_beta_density_by_sample_group.png",
+    plot = p_density,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+
+```
+
+### Additional QC plots using minfi-mds plot and densitybean plot
+```{r save_mdsPlot, results='hide', fig.show='hide'}
+library(minfi)
+## mds plot
+graphics.off()
+
+beta.m <- as.matrix(beta_new)
+storage.mode(beta.m) <- "numeric"
+
+pd_new <- pd_new[colnames(beta.m), , drop = FALSE]
+group_list <- factor(pd_new$group)
+
+pdf_file <- "verificationPlots/Quality_Control_Plots/GSE199057_mdsPlot.pdf"
+
+pdf(pdf_file, width = 8, height = 6)
+
+tryCatch({
+  mdsPlot(
+    beta.m,
+    numPositions = 1000,
+    sampGroups = group_list,
+    main = "MDS plot using top 1000 variable CpGs"
+  )
+}, finally = {
+  if (dev.cur() > 1) dev.off()
+})
+
+```
+
+### Additional QC plots using density bean plot
+```{r save_densityBeanPlot, results='hide', fig.show='hide'}
+library(minfi)
+
+graphics.off()
+
+pdf_file <- "verificationPlots/Quality_Control_Plots/GSE199057_densityBeanPlot.pdf"
+
+pdf(pdf_file, width = 8, height = 6)
+
+tryCatch({
+  densityBeanPlot(
+    beta.m,
+    sampGroups = group_list,
+    main = "Beta value density bean plot"
+  )
+}, finally = {
+  if (dev.cur() > 1) dev.off()
+})
+
+```
+
+## Hypermethylated DMRs from tumor vs Normal
+
+```{r Hypermethylated DMRs from tumor vs Normal}
+rm(list = ls())   
+options(stringsAsFactors = F)
+library("ChAMP")
+
+load(file = 'step2_champ_myNorm_2groups.Rdata')
+group_list <- pd_new$group
+table(group_list)
+
+group_list <- factor(group_list, levels = c("Normal", "Tumor"))
+myDMR <- champ.DMR(beta = beta_new, 
+                   pheno = group_list, 
+                   method = "Bumphunter")
+
+save(myDMR,file = 'myDMR-output-GSE199057.Rdata')
+load(file = 'myDMR-output-GSE199057.Rdata')
+# Extract DMR results
+dmr_results <- myDMR$BumphunterDMR
+# Keep only hypermethylated DMRs (CRC > normal)
+k1 <- dmr_results$value > 0.2#value = βCRC-βnormal
+k2 <- dmr_results$p.value <0.05
+k3 <- dmr_results$L >=5
+hyper_dmrs <- dmr_results [k1 & k2 & k3,]
+
+# Save as Rdata file
+save(hyper_dmrs, file = "hyper_DMRs_CRC_GSE199057.Rdata")
+
+# Save as CSV (most common)
+write.csv(hyper_dmrs, "verificationPlots/hypermethylated_DMRs_CRC_GSE199057.csv", row.names = FALSE)
+```
+
+## Independent validation in GSE119526
+```{r Independent validation in GSE119526}
+############################################################
+# Step 4. Validate GSE199057 hyper-DMRs in GSE119526
+############################################################
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+library(GenomicRanges)
+library(IRanges)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(ggplot2)
+library(pheatmap)
+
+############################################################
+# 1. load and Check input objects
+############################################################
+
+# dD: 620 hyper-DMRs from GSE199057
+# myNorm: normalized beta matrix from GSE119526
+# pD: group vector for GSE119526 samples
+dD <- read.csv("hypermethylated_DMRs_CRC_GSE199057.csv")
+load("step2-GSE119526_champ_myNorm.Rdata")
+dim(dD)
+dim(myNorm)
+length(pD)
+
+head(dD)
+head(rownames(myNorm))
+head(colnames(myNorm))
+table(pD$group)
+
+############################################################
+# 2. Prepare GSE119526 beta matrix and group list
+############################################################
+
+beta_119526 <- myNorm
+
+# Make sure values are beta values between 0 and 1
+range(beta_119526, na.rm = TRUE)
+
+############################################################
+# 2.1 Strictly align pD with beta_119526
+############################################################
+
+# pD must contain sample ID and group
+pD$ID <- as.character(pD$ID)
+pD$group <- as.character(pD$group)
+
+# reorder beta matrix according to pD
+beta_119526 <- beta_119526[, pD$ID, drop = FALSE]
+
+# Critical check
+identical(colnames(beta_119526), pD$ID)
+
+############################################################
+# 2.2 Build group_list safely
+############################################################
+
+group_list <- pD$group
+names(group_list) <- pD$ID
+
+group_list <- factor(group_list, levels = c("normal", "CRC"))
+
+table(group_list)
+
+# Final strict check
+identical(names(group_list), colnames(beta_119526))
+
+############################################################
+# 3. Prepare discovery DMR coordinates
+############################################################
+
+# ChAMP Bumphunter output may use either chr or seqnames
+if (!"chr" %in% colnames(dD) && "seqnames" %in% colnames(dD)) {
+  dD$chr <- dD$seqnames
+}
+
+if (!all(c("chr", "start", "end") %in% colnames(dD))) {
+  stop("dD must contain chr, start, and end columns.")
+}
+
+# Function to standardise chromosome names
+fix_chr <- function(x) {
+  x <- as.character(x)
+  x <- gsub("^chr", "", x, ignore.case = TRUE)
+  x[x == "23"] <- "X"
+  x[x == "24"] <- "Y"
+  x[x %in% c("M", "MT")] <- "M"
+  paste0("chr", x)
+}
+
+dD$chr <- fix_chr(dD$chr)
+dD$start <- as.numeric(dD$start)
+dD$end <- as.numeric(dD$end)
+
+dD <- dD[!is.na(dD$chr) & !is.na(dD$start) & !is.na(dD$end), ]
+
+# Add DMR ID
+dD$DMR_ID <- paste0("DMR_", seq_len(nrow(dD)))
+
+# Keep discovery delta beta if available
+if ("value" %in% colnames(dD)) {
+  dD$deltaBeta_GSE199057 <- dD$value
+}
+
+############################################################
+# 4. Load EPIC annotation and map CpGs to genomic coordinates
+############################################################
+
+anno <- minfi::getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+anno <- as.data.frame(anno)
+anno$CpG <- rownames(anno)
+
+# Keep only CpGs present in GSE119526 beta matrix
+anno <- anno[anno$CpG %in% rownames(beta_119526), ]
+
+anno$chr <- fix_chr(anno$chr)
+anno$pos <- as.numeric(anno$pos)
+
+anno <- anno[!is.na(anno$chr) & !is.na(anno$pos), ]
+
+# Reorder beta matrix according to annotation
+common_cpgs <- intersect(rownames(beta_119526), anno$CpG)
+
+beta_119526 <- beta_119526[common_cpgs, , drop = FALSE]
+anno <- anno[match(common_cpgs, anno$CpG), ]
+
+identical(rownames(beta_119526), anno$CpG)
+
+# CpG genomic ranges
+cpg_gr <- GRanges(
+  seqnames = anno$chr,
+  ranges = IRanges(start = anno$pos, end = anno$pos),
+  CpG = anno$CpG
+)
+
+############################################################
+# 5. Convert discovery DMRs into GRanges
+############################################################
+
+dmr_gr <- GRanges(
+  seqnames = dD$chr,
+  ranges = IRanges(start = dD$start, end = dD$end),
+  DMR_ID = dD$DMR_ID
+)
+
+############################################################
+# 6. Find CpGs inside each discovery DMR
+############################################################
+
+hits <- findOverlaps(dmr_gr, cpg_gr)
+
+cat("Number of DMR-CpG overlaps:", length(hits), "\n")
+
+dmr_cpg_list <- split(
+  mcols(cpg_gr)$CpG[subjectHits(hits)],
+  queryHits(hits)
+)
+
+############################################################
+# 7. Calculate DMR-level beta in GSE119526
+############################################################
+
+validation_results <- dD
+
+validation_results$nCpG_GSE119526 <- 0
+validation_results$meanBeta_normal_GSE119526 <- NA_real_
+validation_results$meanBeta_CRC_GSE119526 <- NA_real_
+validation_results$deltaBeta_GSE119526 <- NA_real_
+validation_results$p.value_GSE119526 <- NA_real_
+
+# DMR-level beta matrix: rows = DMRs, columns = samples
+dmr_beta_119526 <- matrix(
+  NA_real_,
+  nrow = nrow(dD),
+  ncol = ncol(beta_119526),
+  dimnames = list(dD$DMR_ID, colnames(beta_119526))
+)
+
+normal_samples <- names(group_list)[group_list == "normal"]
+crc_samples <- names(group_list)[group_list == "CRC"]
+
+for (i in seq_len(nrow(dD))) {
+  
+  cpgs <- dmr_cpg_list[[as.character(i)]]
+  
+  if (is.null(cpgs)) {
+    next
+  }
+  
+  cpgs <- unique(intersect(cpgs, rownames(beta_119526)))
+  
+  validation_results$nCpG_GSE119526[i] <- length(cpgs)
+  
+  if (length(cpgs) < 1) {
+    next
+  }
+  
+  # Mean beta of all CpGs inside this DMR for each sample
+  dmr_value <- colMeans(beta_119526[cpgs, , drop = FALSE], na.rm = TRUE)
+  
+  dmr_beta_119526[i, ] <- dmr_value
+  
+  normal_value <- dmr_value[normal_samples]
+  crc_value <- dmr_value[crc_samples]
+  
+  validation_results$meanBeta_normal_GSE119526[i] <- mean(normal_value, na.rm = TRUE)
+  validation_results$meanBeta_CRC_GSE119526[i] <- mean(crc_value, na.rm = TRUE)
+  
+  # Key validation value: CRC - normal
+  validation_results$deltaBeta_GSE119526[i] <-
+    mean(crc_value, na.rm = TRUE) - mean(normal_value, na.rm = TRUE)
+  
+  # One-sided Wilcoxon test: CRC beta > normal beta
+  validation_results$p.value_GSE119526[i] <- tryCatch(
+    wilcox.test(
+      crc_value,
+      normal_value,
+      alternative = "greater",
+      exact = FALSE
+    )$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+############################################################
+# 8. Multiple testing correction and validation labels
+############################################################
+
+validation_results$FDR_GSE119526 <- p.adjust(
+  validation_results$p.value_GSE119526,
+  method = "BH"
+)
+
+# Same direction: CRC higher than normal
+validation_results$same_trend <- 
+  validation_results$deltaBeta_GSE119526 > 0
+
+# Direction + moderate effect
+validation_results$same_trend_delta_0.10 <- 
+  validation_results$deltaBeta_GSE119526 > 0.10
+
+# Direction + strong effect, comparable to your discovery threshold
+validation_results$same_trend_delta_0.20 <- 
+  validation_results$deltaBeta_GSE119526 > 0.20
+
+# Direction + nominal significance
+validation_results$validated_p005 <-
+  validation_results$same_trend & 
+  validation_results$p.value_GSE119526 < 0.05
+
+# Direction + FDR significance
+validation_results$validated_FDR005 <- 
+  validation_results$same_trend & 
+  validation_results$FDR_GSE119526 < 0.05
+
+# Recommended strict validation:
+validation_results$validated_strict <-
+  validation_results$deltaBeta_GSE119526 > 0.20 &
+  validation_results$p.value_GSE119526 < 0.05
+
+############################################################
+# 9. Summary
+############################################################
+
+summary_validation <- data.frame(
+  Total_discovery_hyper_DMRs = nrow(validation_results),
+  DMRs_with_CpG_overlap = sum(validation_results$nCpG_GSE119526 > 0, na.rm = TRUE),
+  Same_trend_DMRs = sum(validation_results$same_trend, na.rm = TRUE),
+  Same_trend_percent = round(
+    100 * mean(validation_results$same_trend, na.rm = TRUE),
+    2
+  ),
+  Same_trend_delta_0.10 = sum(validation_results$same_trend_delta_0.10, na.rm = TRUE),
+  Same_trend_delta_0.20 = sum(validation_results$same_trend_delta_0.20, na.rm = TRUE),
+  Validated_p005 = sum(validation_results$validated_p005, na.rm = TRUE),
+  Validated_FDR005 = sum(validation_results$validated_FDR005, na.rm = TRUE),
+  Validated_strict = sum(validation_results$validated_strict, na.rm = TRUE)
+)
+
+print(summary_validation)
+
+############################################################
+# 10. Save validation results
+############################################################
+
+write.csv(
+  validation_results,
+  file = "verificationPlots/GSE119526_validation_results_all_620_DMRs.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  summary_validation,
+  file = "GSE119526_validation_summary.csv",
+  row.names = FALSE
+)
+
+validated_hyper_dmrs <- validation_results[
+  validation_results$validated_strict == TRUE,
+]
+
+write.csv(
+  validated_hyper_dmrs,
+  file = "GSE119526_validated_hyper_DMRs_strict.csv",
+  row.names = FALSE
+)
+
+save(
+  dD,
+  beta_119526,
+  group_list,
+  dmr_beta_119526,
+  validation_results,
+  summary_validation,
+  validated_hyper_dmrs,
+  file = "step4-GSE119526-validation-output.Rdata"
+)
+
+############################################################
+# 11. Plot: discovery delta beta vs validation delta beta
+############################################################
+
+if ("deltaBeta_GSE199057" %in% colnames(validation_results)) {
+  
+  p_scatter <- ggplot(
+    validation_results,
+    aes(
+      x = deltaBeta_GSE199057,
+      y = deltaBeta_GSE119526
+    )
+  ) +
+    geom_point(alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    theme_bw() +
+    labs(
+      title = "Discovery vs validation delta beta",
+      x = "GSE199057 delta beta: CRC - normal",
+      y = "GSE119526 delta beta: CRC - normal"
+    )
+  
+  ggsave(
+    filename = "verificationPlots/ValidationPlots_in_GSE119526/GSE199057_vs_GSE119526_deltaBeta_scatter.png",
+    plot = p_scatter,
+    width = 6,
+    height = 5,
+    dpi = 300
+  )
+}
+
+############################################################
+# 12. Plot: heatmap of top validated DMRs
+############################################################
+
+top_dmr_ids <- validation_results$DMR_ID[
+  validation_results$validated_strict == TRUE
+]
+
+top_dmr_ids <- top_dmr_ids[!is.na(top_dmr_ids)]
+
+if (length(top_dmr_ids) >= 2) {
+  
+  top_dmr_ids <- top_dmr_ids[seq_len(min(50, length(top_dmr_ids)))]
+  
+  heat_mat <- dmr_beta_119526[top_dmr_ids, , drop = FALSE]
+  
+  annotation_col <- data.frame(
+    Group = group_list,
+    row.names = names(group_list)
+  )
+  
+  pheatmap(
+    heat_mat,
+    scale = "row",
+    show_colnames = FALSE,
+    show_rownames = TRUE,
+    annotation_col = annotation_col,
+    cluster_cols = FALSE,
+    filename = "verificationPlots/ValidationPlots_in_GSE119526/GSE119526_top_validated_DMRs_heatmap.png",
+    width = 8,
+    height = 8
+  )
+}
+
+############################################################
+# 12.Separate effect-size and significance criteria
+############################################################
+
+validation_count_df2 <- data.frame(
+  Category = c(
+    "Coverage / direction",
+    "Coverage / direction",
+    "Effect size",
+    "Effect size",
+    "Significance",
+    "Significance",
+    "Combined strict"
+  ),
+  
+  Criterion = c(
+    "CpG overlap",
+    "Same direction\nΔβ > 0",
+    "Δβ > 0.10",
+    "Δβ > 0.20",
+    "Direction + P < 0.05",
+    "Direction + FDR < 0.05",
+    "Δβ > 0.20 & P < 0.05"
+  ),
+  
+  Count = c(
+    sum(validation_results$nCpG_GSE119526 > 0, na.rm = TRUE),
+    sum(validation_results$same_trend, na.rm = TRUE),
+    sum(validation_results$same_trend_delta_0.10, na.rm = TRUE),
+    sum(validation_results$same_trend_delta_0.20, na.rm = TRUE),
+    sum(validation_results$validated_p005, na.rm = TRUE),
+    sum(validation_results$validated_FDR005, na.rm = TRUE),
+    sum(validation_results$validated_strict, na.rm = TRUE)
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+validation_count_df2$Percent <- round(
+  100 * validation_count_df2$Count / nrow(validation_results),
+  2
+)
+
+validation_count_df2$Label <- paste0(
+  validation_count_df2$Count,
+  " (",
+  validation_count_df2$Percent,
+  "%)"
+)
+
+validation_count_df2$Criterion <- factor(
+  validation_count_df2$Criterion,
+  levels = validation_count_df2$Criterion
+)
+
+p_count_facet <- ggplot(
+  validation_count_df2,
+  aes(x = Criterion, y = Count)
+) +
+  geom_col(width = 0.7, fill = "grey70", color = "black") +
+  geom_text(
+    aes(label = Label),
+    vjust = -0.25,
+    size = 3.3
+  ) +
+  facet_wrap(~ Category, scales = "free_x") +
+  ylim(0, max(validation_count_df2$Count) * 1.18) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    title = "Validation of GSE199057 hyper-DMRs in GSE119526",
+    x = "Validation criterion",
+    y = "Number of DMRs"
+  )
+
+ggsave(
+  filename = "verificationPlots/ValidationPlots_in_GSE119526/GSE119526_validation_DMR_counts_by_category.png",
+  plot = p_count_facet,
+  width = 10,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+## low-background-filtering-using-GSE123478 (9 normal tissues)
+```{r Low-background filtering in other normal tissues}
+############################################################
+# Step 5. Low-background filtering using GSE213478
+#
+# Goal:
+#   Start from the 48 validated DMRs.
+#   Remove DMRs with high background methylation in GSE213478.
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+library(GEOquery)
+library(Biobase)
+library(minfi)
+library(GenomicRanges)
+library(IRanges)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(ggplot2)
+library(pheatmap)
+
+############################################################
+# 1. Load the 48 validated DMRs from previous step
+############################################################
+
+load("step4-GSE119526-validation-output.Rdata")
+
+# Use the 48 strict validated DMRs
+dmr_48 <- validation_results[
+  validation_results$validated_strict == TRUE,
+]
+
+dim(dmr_48)
+
+# Check
+table(dmr_48$validated_strict)
+summary(dmr_48$deltaBeta_GSE119526)
+
+############################################################
+# 2. Prepare DMR coordinates
+############################################################
+
+if (!"chr" %in% colnames(dmr_48) && "seqnames" %in% colnames(dmr_48)) {
+  dmr_48$chr <- dmr_48$seqnames
+}
+
+if (!all(c("chr", "start", "end", "DMR_ID") %in% colnames(dmr_48))) {
+  stop("dmr_48 must contain chr/start/end/DMR_ID columns.")
+}
+
+fix_chr <- function(x) {
+  x <- as.character(x)
+  x <- gsub("^chr", "", x, ignore.case = TRUE)
+  x[x == "23"] <- "X"
+  x[x == "24"] <- "Y"
+  x[x %in% c("M", "MT")] <- "M"
+  paste0("chr", x)
+}
+
+dmr_48$chr <- fix_chr(dmr_48$chr)
+dmr_48$start <- as.numeric(dmr_48$start)
+dmr_48$end <- as.numeric(dmr_48$end)
+
+dmr_48 <- dmr_48[
+  !is.na(dmr_48$chr) &
+    !is.na(dmr_48$start) &
+    !is.na(dmr_48$end),
+]
+
+############################################################
+# 3. Load GSE213478 beta matrix
+############################################################
+
+# If you already have a processed GSE213478 beta matrix,
+# you can skip this getGEO part and directly assign:
+# beta_213478 <- your_GSE213478_beta_matrix
+#eset2 <- getGEO("GSE213478", destdir = "./", AnnotGPL = TRUE, getGPL = FALSE)
+#pdata_all <- pData(eset2[[1]])
+
+#beta_213478 <- fread("GSE213478_methylation_DNAm_noob_final_BMIQ_all_tissues_987.txt.gz",data.table = F)
+#rownames(beta_213478) <- beta_213478[, 1]
+#beta_213478 <- beta_213478[, -1]
+#save(pdata_all,beta_213478,file = "step5.1-GSE213478-normal_tissuesoutput.Rdata")
+
+load("step5.0-GSE213478-normal_tissuesoutput.Rdata")
+
+dim(beta_213478)
+#range(beta_213478, na.rm = TRUE)
+
+############################################################
+# 4. Remove probes with too many missing values
+############################################################
+
+keep_probe <- rowMeans(!is.na(beta_213478)) >= 0.95
+beta_213478 <- beta_213478[keep_probe, , drop = FALSE]
+
+dim(beta_213478)
+
+############################################################
+# 5. Load EPIC annotation and map CpGs to genomic coordinates
+############################################################
+
+anno <- minfi::getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+anno <- as.data.frame(anno)
+anno$CpG <- rownames(anno)
+
+anno <- anno[anno$CpG %in% rownames(beta_213478), ]
+
+anno$chr <- fix_chr(anno$chr)
+anno$pos <- as.numeric(anno$pos)
+
+anno <- anno[
+  !is.na(anno$chr) &
+    !is.na(anno$pos),
+]
+
+# Align beta matrix and annotation
+common_cpgs <- intersect(rownames(beta_213478), anno$CpG)
+
+beta_213478 <- beta_213478[common_cpgs, , drop = FALSE]
+anno <- anno[match(common_cpgs, anno$CpG), ]
+
+identical(rownames(beta_213478), anno$CpG)
+
+cpg_gr <- GRanges(
+  seqnames = anno$chr,
+  ranges = IRanges(start = anno$pos, end = anno$pos),
+  CpG = anno$CpG
+)
+
+############################################################
+# 6. Convert 48 DMRs into GRanges
+############################################################
+
+dmr_gr <- GRanges(
+  seqnames = dmr_48$chr,
+  ranges = IRanges(start = dmr_48$start, end = dmr_48$end),
+  DMR_ID = dmr_48$DMR_ID
+)
+
+############################################################
+# 7. Find CpGs inside each DMR in GSE213478
+############################################################
+
+hits <- findOverlaps(dmr_gr, cpg_gr)
+
+cat("Number of DMR-CpG overlaps in GSE213478:", length(hits), "\n")
+
+dmr_cpg_list <- split(
+  mcols(cpg_gr)$CpG[subjectHits(hits)],
+  queryHits(hits)
+)
+
+############################################################
+# 8. Calculate DMR-level beta in GSE213478
+############################################################
+
+dmr_beta_213478 <- matrix(
+  NA_real_,
+  nrow = nrow(dmr_48),
+  ncol = ncol(beta_213478),
+  dimnames = list(dmr_48$DMR_ID, colnames(beta_213478))
+)
+
+background_results <- dmr_48
+
+background_results$nCpG_GSE213478 <- 0
+background_results$meanBeta_GSE213478 <- NA_real_
+background_results$medianBeta_GSE213478 <- NA_real_
+background_results$maxBeta_GSE213478 <- NA_real_
+background_results$p95Beta_GSE213478 <- NA_real_
+background_results$propSamples_beta_gt_0.20_GSE213478 <- NA_real_
+
+for (i in seq_len(nrow(dmr_48))) {
+  
+  cpgs <- dmr_cpg_list[[as.character(i)]]
+  
+  if (is.null(cpgs)) {
+    next
+  }
+  
+  cpgs <- unique(intersect(cpgs, rownames(beta_213478)))
+  
+  background_results$nCpG_GSE213478[i] <- length(cpgs)
+  
+  if (length(cpgs) < 1) {
+    next
+  }
+  
+  # DMR-level beta per sample
+  dmr_value <- colMeans(beta_213478[cpgs, , drop = FALSE], na.rm = TRUE)
+  
+  dmr_beta_213478[i, ] <- dmr_value
+  
+  background_results$meanBeta_GSE213478[i] <- mean(dmr_value, na.rm = TRUE)
+  background_results$medianBeta_GSE213478[i] <- median(dmr_value, na.rm = TRUE)
+  background_results$maxBeta_GSE213478[i] <- max(dmr_value, na.rm = TRUE)
+  background_results$p95Beta_GSE213478[i] <- as.numeric(
+    quantile(dmr_value, probs = 0.95, na.rm = TRUE)
+  )
+  background_results$propSamples_beta_gt_0.20_GSE213478[i] <- mean(
+    dmr_value > 0.20,
+    na.rm = TRUE
+  )
+}
+
+############################################################
+# 9. Define high-background exclusion criteria
+############################################################
+
+# Criterion A: strictest
+# Exclude if any GSE213478 sample has DMR beta > 0.20
+background_results$exclude_by_max_beta_gt_0.20 <-
+  background_results$maxBeta_GSE213478 > 0.20
+
+# Criterion B: recommended for large multi-tissue background
+# Exclude if 95th percentile beta > 0.20
+background_results$exclude_by_p95_beta_gt_0.20 <-
+  background_results$p95Beta_GSE213478 > 0.20
+
+# Criterion C: more relaxed
+# Exclude only if mean background beta > 0.20
+background_results$exclude_by_mean_beta_gt_0.20 <-
+  background_results$meanBeta_GSE213478 > 0.20
+
+############################################################
+# 10. Choose final low-background rule
+############################################################
+
+# Recommended default:
+# Use p95 <= 0.20 as low-background criterion
+# This avoids one extreme outlier sample removing a DMR.
+
+low_background_dmrs <- background_results[
+  background_results$nCpG_GSE213478 > 0 &
+    background_results$exclude_by_p95_beta_gt_0.20 == FALSE,
+]
+
+removed_high_background_dmrs <- background_results[
+  background_results$exclude_by_p95_beta_gt_0.20 == TRUE,
+]
+
+############################################################
+# 11. Summary
+############################################################
+
+background_summary <- data.frame(
+  Input_validated_DMRs = nrow(background_results),
+  DMRs_with_CpG_overlap_GSE213478 = sum(background_results$nCpG_GSE213478 > 0, na.rm = TRUE),
+  
+  Excluded_by_max_beta_gt_0.20 = sum(background_results$exclude_by_max_beta_gt_0.20, na.rm = TRUE),
+  Retained_by_max_beta_le_0.20 = sum(!background_results$exclude_by_max_beta_gt_0.20, na.rm = TRUE),
+  
+  Excluded_by_p95_beta_gt_0.20 = sum(background_results$exclude_by_p95_beta_gt_0.20, na.rm = TRUE),
+  Retained_by_p95_beta_le_0.20 = nrow(low_background_dmrs),
+  
+  Excluded_by_mean_beta_gt_0.20 = sum(background_results$exclude_by_mean_beta_gt_0.20, na.rm = TRUE),
+  Retained_by_mean_beta_le_0.20 = sum(!background_results$exclude_by_mean_beta_gt_0.20, na.rm = TRUE)
+)
+
+print(background_summary)
+
+############################################################
+# Extract DMRs retained by mean beta <= 0.20
+############################################################
+
+low_background_dmrs_mean <- background_results[
+  background_results$nCpG_GSE213478 > 0 &
+    background_results$meanBeta_GSE213478 <= 0.20,
+]
+
+removed_high_background_dmrs_mean <- background_results[
+  background_results$nCpG_GSE213478 > 0 &
+    background_results$meanBeta_GSE213478 > 0.20,
+]
+
+dim(low_background_dmrs_mean)
+dim(removed_high_background_dmrs_mean)
+
+write.csv(
+  low_background_dmrs_mean,
+  file = "verificationPlots/GSE213478_retained_low_background_DMRs_meanBeta_le_0.20.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  removed_high_background_dmrs_mean,
+  file = "verificationPlots/GSE213478_removed_high_background_DMRs_meanBeta_gt_0.20.csv",
+  row.names = FALSE
+)
+
+save(
+  low_background_dmrs_mean,
+  removed_high_background_dmrs_mean,
+  file = "step5-GSE213478-low-background-filter-meanBeta-output.Rdata"
+)
+############################################################
+# Plot: retained vs removed DMRs after mean beta filtering
+############################################################
+n_input <- nrow(background_results)
+n_retained <- nrow(low_background_dmrs_mean)
+n_removed <- nrow(removed_high_background_dmrs_mean)
+plot_df <- data.frame(
+  Status = c(
+    "Retained\nmean beta ≤ 0.20",
+    "Removed\nmean beta > 0.20"
+  ),
+  Count = c(
+    n_retained,
+    n_removed
+  ),
+  stringsAsFactors = FALSE
+)
+
+plot_df$Percent <- round(
+  100 * plot_df$Count / n_input,
+  2
+)
+
+plot_df$Label <- paste0(
+  plot_df$Count,
+  " DMRs\n(",
+  plot_df$Percent,
+  "%)"
+)
+
+p_retained_removed <- ggplot(
+  plot_df,
+  aes(x = "GSE213478\nmean beta filter", y = Count, fill = Status)
+) +
+  geom_col(
+    width = 0.45,
+    color = "black"
+  ) +
+  geom_text(
+    aes(label = Label),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 13, hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Retained and removed DMRs after GSE213478 filtering",
+    x = "",
+    y = "Number of DMRs",
+    fill = "Filtering result"
+  )
+
+print(p_retained_removed)
+
+ggsave(
+  filename = "verificationPlots/background_filtering_in_GSE123478/GSE213478_48_to_42_retained_removed_stacked_bar.png",
+  plot = p_retained_removed,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
+```
+
+## low-background-filtering-using-GSE196696(whole blood cells)
+```{r low background filtering in whole blood cells}
+############################################################
+# Step 6. Continue low-background filtering in GSE196696
+#
+# Input:
+#   42 DMRs retained after GSE213478 mean beta <= 0.20
+#
+# Goal:
+#   Further filter candidate DMRs using GSE196696
+#   Criterion: mean beta in GSE196696 <= 0.20
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+library(GEOquery)
+library(Biobase)
+library(minfi)
+library(GenomicRanges)
+library(IRanges)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(ggplot2)
+library(data.table)
+
+############################################################
+# 1. Load previous GSE213478 mean-beta filtering result
+############################################################
+
+load("step5-GSE213478-low-background-filter-meanBeta-output.Rdata")
+
+dim(low_background_dmrs_mean)
+dim(removed_high_background_dmrs_mean)
+
+# Use the 42 retained DMRs as input for GSE196696 filtering
+candidate_dmrs <- low_background_dmrs_mean
+
+cat("Input DMRs for GSE196696 filtering:", nrow(candidate_dmrs), "\n")
+
+############################################################
+# 2. Prepare DMR coordinates
+############################################################
+
+candidate_dmrs <- as.data.frame(candidate_dmrs)
+
+# If chr column is absent but seqnames exists, create chr
+if (!"chr" %in% colnames(candidate_dmrs) && "seqnames" %in% colnames(candidate_dmrs)) {
+  candidate_dmrs$chr <- candidate_dmrs$seqnames
+}
+
+if (!all(c("chr", "start", "end", "DMR_ID") %in% colnames(candidate_dmrs))) {
+  stop("candidate_dmrs must contain chr/start/end/DMR_ID columns.")
+}
+
+fix_chr <- function(x) {
+  x <- as.character(x)
+  x <- gsub("^chr", "", x, ignore.case = TRUE)
+  x[x == "23"] <- "X"
+  x[x == "24"] <- "Y"
+  x[x %in% c("M", "MT")] <- "M"
+  paste0("chr", x)
+}
+
+candidate_dmrs$chr <- fix_chr(candidate_dmrs$chr)
+candidate_dmrs$start <- as.numeric(candidate_dmrs$start)
+candidate_dmrs$end <- as.numeric(candidate_dmrs$end)
+
+candidate_dmrs <- candidate_dmrs[
+  !is.na(candidate_dmrs$chr) &
+    !is.na(candidate_dmrs$start) &
+    !is.na(candidate_dmrs$end),
+]
+
+dim(candidate_dmrs)
+
+############################################################
+# 3. Load GSE196696 beta matrix
+############################################################
+
+if(F){eset196 <- getGEO(
+  "GSE196696",
+  destdir = "./",
+  GSEMatrix = TRUE,
+  AnnotGPL = FALSE,
+  getGPL = FALSE
+)
+
+eset196 <- eset196[[1]]
+pd_196696 <- pData(eset196)
+
+file_196696 <- "GSE196696_processed_data.tsv.gz"
+
+# Read only first 5 rows to check format
+#test_196696 <- fread(file_196696,nrows = 5,data.table = FALSE,check.names = FALSE)
+
+#dim(test_196696)
+#colnames(test_196696)[1:10]
+#test_196696[1:5, 1:5]
+
+#Read GSE196696 processed data and extract beta values
+
+# read processed data
+raw_196696 <- fread(file_196696,data.table = FALSE,check.names = FALSE)
+save(raw_196696,file = 'raw_196696.Rdata')
+
+load("raw_196696.Rdata")
+
+raw_df <- as.data.frame(raw_196696)
+pd_df  <- as.data.frame(pd_196696)
+
+# Extract array_id from title
+pd_df$array_id <- sub(".* -\\s*", "", pd_df$title)
+
+# Check extraction result
+head(pd_df[, c("geo_accession", "title", "array_id")])
+
+#  Extract beta value columns
+beta_cols <- colnames(raw_df)[
+  colnames(raw_df) != "ID_REF" &
+    !grepl("^Detection Pval", colnames(raw_df))
+]
+
+length(beta_cols)
+head(beta_cols)
+
+# Build mapping from array_id to GSM
+array_to_gsm <- setNames(pd_df$geo_accession, pd_df$array_id)
+
+# Check whether any raw data column cannot be mapped to GSM
+unmatched <- setdiff(beta_cols, names(array_to_gsm))
+
+if (length(unmatched) > 0) {
+  print(head(unmatched))
+  stop("Some beta columns cannot be matched to GSM using array_id extracted from pd_196696$title. Please check title format or column name format.")
+}
+
+# Get GSM names in the order of beta_cols
+gsm_names <- unname(array_to_gsm[beta_cols])
+
+#  Check mapping correctness
+head(data.frame(raw_column = beta_cols, GSM = gsm_names))
+
+# Extract beta dataframe
+beta_df <- raw_df[, c("ID_REF", beta_cols), drop = FALSE]
+
+# Check for duplicate ID_REF
+if (anyDuplicated(beta_df$ID_REF) > 0) {
+  stop("Duplicate probes found in ID_REF, please handle duplicates first.")
+}
+
+#  Build standard beta value matrix
+beta_196696 <- beta_df[, beta_cols, drop = FALSE]
+rownames(beta_196696) <- beta_df$ID_REF
+colnames(beta_196696) <- gsm_names
+
+# Convert to numeric matrix
+beta_196696 <- as.matrix(beta_196696)
+storage.mode(beta_196696) <- "numeric"
+
+# Basic checks
+dim(beta_196696)
+range(beta_196696, na.rm = TRUE)
+head(rownames(beta_196696))
+head(colnames(beta_196696))
+
+# Further check if it conforms to beta matrix standards
+sum(is.na(colnames(beta_196696)))
+sum(is.na(rownames(beta_196696)))
+anyDuplicated(colnames(beta_196696))
+anyDuplicated(rownames(beta_196696))
+
+save(beta_196696,pd_196696,file = 'beta_pd_196696_output.Rdata')
+}
+
+load("beta_pd_196696_output.Rdata")
+
+############################################################
+# 4. Basic CpG filtering
+############################################################
+
+# Keep CpG probes only
+beta_196696 <- beta_196696[
+  grepl("^cg", rownames(beta_196696)),
+  ,
+  drop = FALSE
+]
+
+# Remove probes with too many missing values
+keep_probe <- rowMeans(!is.na(beta_196696)) >= 0.95
+beta_196696 <- beta_196696[keep_probe, , drop = FALSE]
+
+dim(beta_196696)
+
+############################################################
+# 5. Load EPIC annotation and map CpGs to genomic coordinates
+############################################################
+
+anno <- minfi::getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+anno <- as.data.frame(anno)
+anno$CpG <- rownames(anno)
+
+anno <- anno[anno$CpG %in% rownames(beta_196696), ]
+
+anno$chr <- fix_chr(anno$chr)
+anno$pos <- as.numeric(anno$pos)
+
+anno <- anno[
+  !is.na(anno$chr) &
+    !is.na(anno$pos),
+]
+
+common_cpgs <- intersect(rownames(beta_196696), anno$CpG)
+
+beta_196696 <- beta_196696[common_cpgs, , drop = FALSE]
+anno <- anno[match(common_cpgs, anno$CpG), ]
+
+stopifnot(identical(rownames(beta_196696), anno$CpG))
+
+cpg_gr <- GRanges(
+  seqnames = anno$chr,
+  ranges = IRanges(start = anno$pos, end = anno$pos),
+  CpG = anno$CpG
+)
+
+############################################################
+# 6. Convert candidate DMRs to GRanges
+############################################################
+
+dmr_gr <- GRanges(
+  seqnames = candidate_dmrs$chr,
+  ranges = IRanges(
+    start = candidate_dmrs$start,
+    end = candidate_dmrs$end
+  ),
+  DMR_ID = candidate_dmrs$DMR_ID
+)
+
+############################################################
+# 7. Find CpGs inside each DMR in GSE196696
+############################################################
+
+hits <- findOverlaps(dmr_gr, cpg_gr)
+
+cat("Number of DMR-CpG overlaps in GSE196696:", length(hits), "\n")
+
+dmr_cpg_list <- split(
+  mcols(cpg_gr)$CpG[subjectHits(hits)],
+  queryHits(hits)
+)
+
+############################################################
+# 8. Calculate DMR-level background beta in GSE196696
+############################################################
+
+dmr_beta_196696 <- matrix(
+  NA_real_,
+  nrow = nrow(candidate_dmrs),
+  ncol = ncol(beta_196696),
+  dimnames = list(candidate_dmrs$DMR_ID, colnames(beta_196696))
+)
+
+background_results_196696 <- candidate_dmrs
+
+background_results_196696$nCpG_GSE196696 <- 0
+background_results_196696$meanBeta_GSE196696 <- NA_real_
+background_results_196696$medianBeta_GSE196696 <- NA_real_
+background_results_196696$maxBeta_GSE196696 <- NA_real_
+background_results_196696$p95Beta_GSE196696 <- NA_real_
+background_results_196696$propSamples_beta_gt_0.20_GSE196696 <- NA_real_
+
+for (i in seq_len(nrow(candidate_dmrs))) {
+  
+  cpgs <- dmr_cpg_list[[as.character(i)]]
+  
+  if (is.null(cpgs)) {
+    next
+  }
+  
+  cpgs <- unique(intersect(cpgs, rownames(beta_196696)))
+  
+  background_results_196696$nCpG_GSE196696[i] <- length(cpgs)
+  
+  if (length(cpgs) < 1) {
+    next
+  }
+  
+  # DMR-level beta per sample
+  dmr_value <- colMeans(beta_196696[cpgs, , drop = FALSE], na.rm = TRUE)
+  
+  dmr_beta_196696[i, ] <- dmr_value
+  
+  background_results_196696$meanBeta_GSE196696[i] <- mean(dmr_value, na.rm = TRUE)
+  background_results_196696$medianBeta_GSE196696[i] <- median(dmr_value, na.rm = TRUE)
+  background_results_196696$maxBeta_GSE196696[i] <- max(dmr_value, na.rm = TRUE)
+  background_results_196696$p95Beta_GSE196696[i] <- as.numeric(
+    quantile(dmr_value, probs = 0.95, na.rm = TRUE)
+  )
+  background_results_196696$propSamples_beta_gt_0.20_GSE196696[i] <- mean(
+    dmr_value > 0.20,
+    na.rm = TRUE
+  )
+}
+
+############################################################
+# 9. Filter by mean beta <= 0.20 in GSE196696
+############################################################
+
+low_background_dmrs_mean_196696 <- background_results_196696[
+  background_results_196696$nCpG_GSE196696 > 0 &
+    background_results_196696$meanBeta_GSE196696 <= 0.20,
+]
+
+removed_high_background_dmrs_mean_196696 <- background_results_196696[
+  background_results_196696$nCpG_GSE196696 > 0 &
+    background_results_196696$meanBeta_GSE196696 > 0.20,
+]
+
+dim(low_background_dmrs_mean_196696)
+dim(removed_high_background_dmrs_mean_196696)
+
+############################################################
+# 10. Summary
+############################################################
+
+background_summary_196696 <- data.frame(
+  Input_DMRs_after_GSE213478_mean_filter = nrow(background_results_196696),
+  DMRs_with_CpG_overlap_GSE196696 = sum(background_results_196696$nCpG_GSE196696 > 0, na.rm = TRUE),
+  Excluded_by_mean_beta_gt_0.20_GSE196696 = nrow(removed_high_background_dmrs_mean_196696),
+  Retained_by_mean_beta_le_0.20_GSE196696 = nrow(low_background_dmrs_mean_196696),
+  Retained_percent = round(
+    100 * nrow(low_background_dmrs_mean_196696) / nrow(background_results_196696),
+    2
+  )
+)
+
+print(background_summary_196696)
+
+############################################################
+# 11. Save outputs
+############################################################
+
+write.csv(
+  background_results_196696,
+  file = "verificationPlots/GSE196696_background_filter_all_42_DMRs.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  low_background_dmrs_mean_196696,
+  file = "verificationPlots/GSE196696_retained_low_background_DMRs_meanBeta_le_0.20.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  removed_high_background_dmrs_mean_196696,
+  file = "verificationPlots/GSE196696_removed_high_background_DMRs_meanBeta_gt_0.20.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  background_summary_196696,
+  file = "verificationPlots/GSE196696_background_filter_summary_meanBeta.csv",
+  row.names = FALSE
+)
+
+save(
+  candidate_dmrs,
+  beta_196696,
+  pd_196696,
+  dmr_beta_196696,
+  background_results_196696,
+  low_background_dmrs_mean_196696,
+  removed_high_background_dmrs_mean_196696,
+  background_summary_196696,
+  file = "step6-GSE196696-low-background-filter-meanBeta-output.Rdata"
+)
+#################################################################################
+## Visualisation
+#################################################################################
+
+load("step6-GSE196696-low-background-filter-meanBeta-output.Rdata")
+##Fig1 GSE196696_filtering_flow
+
+library(ggplot2)
+
+flow_df <- data.frame(
+  Step = factor(
+    c(
+      "Input after GSE213478",
+      "With CpG overlap in GSE196696",
+      "Retained: mean beta <= 0.20",
+      "Removed: mean beta > 0.20"
+    ),
+    levels = c(
+      "Input after GSE213478",
+      "With CpG overlap in GSE196696",
+      "Retained: mean beta <= 0.20",
+      "Removed: mean beta > 0.20"
+    )
+  ),
+  Count = c(
+    nrow(background_results_196696),
+    sum(background_results_196696$nCpG_GSE196696 > 0, na.rm = TRUE),
+    nrow(low_background_dmrs_mean_196696),
+    nrow(removed_high_background_dmrs_mean_196696)
+  )
+)
+
+p_flow <- ggplot(flow_df, aes(x = Step, y = Count)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = Count), vjust = -0.4, size = 4) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "GSE196696 whole-blood background filtering",
+    x = NULL,
+    y = "Number of DMRs"
+  ) +
+  ylim(0, max(flow_df$Count) * 1.15) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+p_flow
+
+ggsave(
+  "verificationPlots/background_filtering_in_GSE196696/GSE196696_filtering_flow.png",
+  p_flow,
+  width = 7,
+  height = 4.8,
+  dpi = 300
+)
+
+##  Figure2 Are the 42 candidate DMRs low-methylated in GSE196696 whole blood?
+plot_df <- background_results_196696[
+  background_results_196696$nCpG_GSE196696 > 0,
+]
+
+p_mean_box <- ggplot(plot_df, aes(x = "GSE196696 whole blood", y = meanBeta_GSE196696)) +
+  geom_boxplot(width = 0.35, outlier.shape = NA) +
+  geom_jitter(width = 0.08, size = 2, alpha = 0.75) +
+  geom_hline(
+    yintercept = 0.20,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Low-background methylation of retained DMRs in GSE196696",
+    x = NULL,
+    y = "DMR-level mean beta"
+  ) +
+  ylim(0, 0.25) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+p_mean_box
+
+ggsave(
+  "verificationPlots/background_filtering_in_GSE196696/GSE196696_meanBeta_boxplot.png",
+  p_mean_box,
+  width = 4.8,
+  height = 4.8,
+  dpi = 300
+)
+
+
+##Figure3 DMR × sample heatmap
+
+library(pheatmap)
+
+#  Keep only DMRs with CpG overlap
+heat_mat <- dmr_beta_196696[
+  rownames(dmr_beta_196696) %in% plot_df$DMR_ID,
+  ,
+  drop = FALSE
+]
+
+# Sort DMRs by mean beta (high to low)
+heat_mat <- heat_mat[
+  order(rowMeans(heat_mat, na.rm = TRUE), decreasing = TRUE),
+  ,
+  drop = FALSE
+]
+
+# For clarity, do not show 570 sample names
+pdf(
+  "verificationPlots/background_filtering_in_GSE196696/GSE196696_DMR_sample_heatmap.pdf",
+  width = 10,
+  height = 7
+)
+
+pheatmap(
+  heat_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 6,
+  breaks = seq(0, 0.25, length.out = 101),
+  main = "DMR-level beta values in GSE196696 whole blood"
+)
+
+dev.off()
+```
+
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
