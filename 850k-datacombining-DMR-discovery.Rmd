@@ -1,0 +1,694 @@
+---
+title: "3 datasets combining"
+author: "YC"
+date: "2026-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## data preprocessing-standard beta value matrix and pd group information
+### GSE199057
+```{r GSE199057}
+## GSE199057 EPIC methylation processed matrix pipeline
+##   1. Read GEO metadata.
+##   2. Build phenotype table pD.
+##   3. Extract AVG_Beta columns from the processed matrix.
+##   4. Map processed sample IDs to GSM IDs.
+##   5. Remove plate-control samples.
+##   6. Generate a strict beta matrix: CpG probes × GSM samples.
+##   7. Remove probes with missing beta values.
+##   8. Align pD rows with beta matrix columns.
+##   9. Run ChAMP filtering.
+
+############################################################
+## Module 0. Clear environment and load required packages
+############################################################
+rm(list = ls())
+options(stringsAsFactors = F)
+require(GEOquery)
+require(Biobase)
+library("impute")
+library(ChAMP)
+
+############################################################
+## Module 1. Read GEO metadata
+############################################################
+# Ensure that the methylation beta matrix and the phenotype information strictly correspond to each other
+# Download/read GEO series matrix metadata.
+eset <- getGEO("GSE199057",destdir = './',AnnotGPL = T,getGPL = F)
+#beta.m <- exprs(eset[[1]])
+
+############################################################
+## Module 2. Build phenotype table pD
+############################################################
+## Build a clean phenotype table.
+## ID is the GSM accession.
+## title is the original GEO sample description.
+## pD.all contains sample-level information, including:
+##   - GSM accession IDs
+##   - sample titles
+##   - clinical/sample descriptions
+## Modify this part when applying the pipeline to another dataset
+pD.all <- pData(eset[[1]])
+pD <- pD.all[,c(1,2)]
+names(pD) <- c("group", "ID")
+pD$group <- ifelse(
+  grepl("normal",pD$group,ignore.case = T),
+  "Normal","Tumor")
+pd <-pD
+#⭐Check if the extracted groupings are correct
+check_df <- data.frame(Title = pD.all$title, Group = pD$group)
+head(check_df, 10)
+tail(check_df,10)
+table(pd$group)
+############################################################
+## Module 3. Read processed methylation matrix
+############################################################
+
+## Read the processed methylation matrix.
+## For GSE199057, this matrix contains:
+##   TargetID
+##   sample_id.AVG_Beta
+##   sample_id.Detection Pval
+#beta.m <- exprs(eset[[1]])
+library(data.table)
+beta.m <- fread("GSE199057_processed_methlyation_matrix.txt.gz",data.table = F)
+dim(beta.m)
+############################################################
+## Module 4. Extract AVG_Beta columns
+############################################################
+
+## Identify columns containing beta values.
+## These are the columns ending with ".AVG_Beta".
+beta_cols <- grep("\\.AVG_Beta$", colnames(beta.m), value = TRUE)
+## Extract internal sample IDs by removing ".AVG_Beta".
+## Example:
+##   "1018133.AVG_Beta" becomes "1018133"
+beta_sample_id <- sub("\\.AVG_Beta$", "", beta_cols)
+## Check beta columns
+head(beta_sample_id)
+############################################################
+## Module 5. Build mapping table from internal sample IDs to GSM IDs
+############################################################
+
+## GEO titles contain internal sample IDs in square brackets.
+## Example:
+##   title = "normal colon tissue from CRC patient [1018133]"
+##   SampleID = "1018133"
+sample_map <- data.frame(
+  GSM = pD.all$geo_accession,
+  title = pD.all$title,
+  stringsAsFactors = FALSE
+)
+sample_map$SampleID <- sub(".*\\[([^]]+)\\].*", "\\1", sample_map$title)
+head(sample_map)
+## Match processed matrix sample IDs to GEO metadata sample IDs.
+idx <- match(beta_sample_id, sample_map$SampleID)
+
+beta_to_GSM <- data.frame(
+  beta_column = beta_cols,
+  SampleID = beta_sample_id,
+  GSM = sample_map$GSM[idx],
+  title = sample_map$title[idx],
+  stringsAsFactors = FALSE
+)
+
+head(beta_to_GSM)
+#View(beta_to_GSM)
+## Check unmatched samples and NA value
+sum(is.na(beta_to_GSM$GSM))
+beta_to_GSM[is.na(beta_to_GSM$GSM), ]
+############################################################
+## Module 6. Manually fix known ID-format mismatches
+############################################################
+
+## In GSE199057, two technical replicates use hyphens in the processed matrix:
+##   T1003588-rep1
+##   T1003588-rep2
+## But GEO metadata title uses spaces:
+##   T1003588 rep1
+##   T1003588 rep2
+## Therefore, manually assign their GSM IDs.
+sample_map[grepl("T1003588", sample_map$title, ignore.case = TRUE),
+                       c("GSM", "SampleID", "title")]
+beta_to_GSM$GSM[beta_to_GSM$SampleID == "T1003588-rep1"] <- "GSM5963372"
+beta_to_GSM$title[beta_to_GSM$SampleID == "T1003588-rep1"] <- 
+  "colon tumor sample from CRC patient [T1003588 rep1]"
+
+beta_to_GSM$GSM[beta_to_GSM$SampleID == "T1003588-rep2"] <- "GSM5963373"
+beta_to_GSM$title[beta_to_GSM$SampleID == "T1003588-rep2"] <- 
+  "colon tumor sample from CRC patient [T1003588 rep2]"
+## Recheck unmatched samples after manual correction.
+sum(is.na(beta_to_GSM$GSM))
+
+beta_to_GSM[is.na(beta_to_GSM$GSM), ]
+
+############################################################
+## Module 7. Remove plate-control samples from beta mapping table
+############################################################
+
+## Plate-control samples are technical controls.
+## They should not be included in Tumor vs NAT / healthy_colon analysis.
+beta_to_GSM_clean <- beta_to_GSM[
+  !grepl("Plate-Control", beta_to_GSM$SampleID, ignore.case = TRUE),
+]
+## Confirm that all retained samples have GSM IDs.
+sum(is.na(beta_to_GSM_clean))
+
+############################################################
+## Module 8. Generate strict beta matrix
+############################################################
+
+## Extract only AVG_Beta columns and convert to a numeric matrix.
+
+beta <- as.matrix(beta.m[, beta_to_GSM_clean$beta_column, drop = FALSE])
+mode(beta) <- "numeric"
+rownames(beta) <- beta.m$TargetID## Set CpG probe IDs as row names.
+colnames(beta) <- beta_to_GSM_clean$GSM## Set GSM IDs as column names.
+
+## Check beta matrix.
+## Expected:
+##   rows = CpG probes
+##   columns = biological GSM samples
+##   values = beta values between 0 and 1
+dim(beta)#224 samples
+beta.m1 <- beta
+############################################################
+## Module 8. Align pD with beta.m1
+############################################################
+
+## Find samples present in pd but not in beta.m1
+samples_to_remove <- setdiff(pd$ID, colnames(beta.m1)); samples_to_remove
+length(samples_to_remove)
+
+## Check the metadata of these samples
+pd[pd$ID %in% samples_to_remove, ]
+
+## Remove these samples from pd
+pd <- pd[!pd$ID %in% samples_to_remove, , drop = FALSE]
+
+## Reorder pd to match beta.m1 column order
+pd <- pd[match(colnames(beta.m1), pd$ID), , drop = FALSE]
+
+## Set row names as GSM IDs
+rownames(pd) <- pd$ID
+
+## Final checks
+setequal(colnames(beta.m1), pd$ID)
+identical(colnames(beta.m1), pd$ID)
+identical(colnames(beta.m1), rownames(pd))
+
+dim(beta.m1)
+dim(pd)
+table(pd$group)
+
+# Set group order
+pd$group <- factor(
+  pd$group,
+  levels = c("Normal","Tumor")
+)
+
+# Sort pd by group
+sample_order <- order(pd$group)
+
+pd <- pd[sample_order, , drop = FALSE]
+
+# Set rownames as GSM ID
+rownames(pd) <- pd$ID
+
+# Reorder beta matrix columns according to pD
+beta.m1 <- beta.m1[, rownames(pd), drop = FALSE]
+
+# Final check
+identical(rownames(pd), colnames(beta.m1))
+table(pd$group)
+pd1 <- pd
+############################################################
+## Module 9. Run ChAMP filtering
+############################################################
+
+## Run ChAMP filtering using the cleaned beta matrix and aligned pd.
+myLoad <- champ.filter(beta = beta.m1, pd = pd1, arraytype = "EPIC")
+## Save the ChAMP object for downstream analysis.
+save(myLoad,file = 'step0.1-GSE199057_output.Rdata')
+
+# For all downstream analyses, simply use this myLoad variable
+#champ.filter() performs initial quality control:
+#(1).Filters out probes with low detection p-value.
+#(2).Removes probes with missing values.
+#(3).Filters sex chromosomes or SNP-associated probes if needed.
+#(4).The output myLoad is an object used for all downstream ChAMP analyses 
+##(normalization, DMP, DMR, pathway analysis).
+```
+
+### GSE149282
+```{r GSE149282}
+## Module 0. Clear environment and load required packages
+rm(list = ls())
+options(stringsAsFactors = F)
+require(GEOquery)
+require(Biobase)
+library("impute")
+library(ChAMP)
+
+############################################################
+## Module 1. Read GEO metadata
+#Ensure that the methylation beta matrix and the phenotype information strictly correspond to each other
+## Download/read GEO series matrix metadata
+eset <- getGEO("GSE149282",destdir = './',AnnotGPL = T,getGPL = F)
+beta.m <- exprs(eset[[1]])
+class(beta.m)
+dim(beta.m)
+
+############################################################
+## Module 2. Build phenotype table pD
+## Build a clean phenotype table.
+## Modify this part when applying the pipeline to another dataset
+pD.all <- pData(eset[[1]])
+pD <- pD.all[,c(1,2)]
+names(pD) <- c("group", "ID")
+pD$group <- ifelse(grepl("normal",pD$group,ignore.case = T),
+  "Normal","Tumor")
+
+#⭐Check if the extracted groupings are correct
+check_df <- data.frame(Title = pD.all$title, Group = pD$group)
+head(check_df, 10)
+tail(check_df,10)
+table(pD$group)
+
+
+############################################################
+## Module 3. Align pD with beta.m
+############################################################
+## Check whether beta.m and pD contain the same sample set.
+## setequal() ignores order.
+identical(rownames(pD),colnames(beta.m))##This must be TRUE before champ.filter().
+setequal(colnames(beta.m), pD$ID)
+# Confirm that there are no duplicated sample names
+sum(duplicated(colnames(beta.m)))
+sum(duplicated(pD$ID))
+
+# Reorder pD to match the column names of beta.m1
+pD <- pD[match(colnames(beta.m), pD$ID), , drop = FALSE]
+
+# Set pD row names as GSM IDs.
+rownames(pD) <- pD$ID
+## Final strict alignment check.
+dim(beta.m)
+dim(pD)
+
+# Set group order
+pD$group <- factor(
+  pD$group,
+  levels = c("Normal", "Tumor"))
+
+# Sort pD by group
+sample_order <- order(pD$group)
+
+pD <- pD[sample_order, , drop = FALSE]
+
+# Reorder beta matrix columns according to pD
+beta.m <- beta.m[, rownames(pD), drop = FALSE]
+
+############################################################
+## Module 4. Run ChAMP filtering
+############################################################
+
+## Run ChAMP filtering using the cleaned beta matrix and aligned pD.
+myLoad <- champ.filter(beta = beta.m, pd = pD, arraytype = "EPIC")
+## Save the ChAMP object for downstream analysis.
+save(myLoad,file = 'step0.2-GSE149282_output.Rdata')
+```
+
+### GSE119526
+```{r GSE119526}
+rm(list = ls())
+options(stringsAsFactors = F)
+
+require(GEOquery)
+require(Biobase)
+library("impute")
+library(ChAMP)
+
+# Make sure that the methylation beta matrix and phenotype information correspond one-to-one.
+eset <- getGEO("GSE119526", destdir = './', AnnotGPL = T, getGPL = F)
+beta.m <- exprs(eset[[1]])
+dim(beta.m)
+
+# Prepare clinical information; note that each specific project may require adjustments.
+pD.all <- pData(eset[[1]])
+pD <- pD.all[, c(1, 2)]
+names(pD) <- c("group", "ID")
+pD$group <- ifelse(grepl("normal", pD$group, ignore.case = T), "Normal", "Tumor")
+# Check if the grouping is correct.
+check_df <- data.frame(Title = pD.all$title, Group = pD$group)
+head(check_df)
+# head(check_df, 10)
+table(pD$group)
+
+# --------------------------------------------------------------------
+# Sort samples: normal first, CRC second
+# --------------------------------------------------------------------
+# Check whether pD and beta.m contain the same samples
+setequal(colnames(beta.m), pD$ID)
+
+# Set group order: Normal first, Tumor second
+pD$group <- factor(pD$group, levels = c("Normal", "Tumor"))
+
+# Get sorted sample order
+sample_order <- order(pD$group)
+
+# Sort phenotype table
+pD <- pD[sample_order, , drop = FALSE]
+
+# Reorder beta matrix columns according to sorted pD
+beta.m <- beta.m[, pD$ID, drop = FALSE]
+
+# Final check: must be TRUE
+identical(colnames(beta.m), pD$ID)
+
+# Check group order
+table(pD$group)
+
+myLoad <- champ.filter(beta = beta.m, pd = pD, arraytype = "EPIC")
+#save as .Rdata
+save(myLoad, file = 'step0.3-GSE119526_output.Rdata')
+
+```
+
+
+## data combining
+
+```{r }
+## OVERALL STRATEGY IMPLEMENTATION
+# GSE199057 → limma
+# GSE149282 → limma
+# GSE119526 → limma
+##extract:Δβ + SE + P--CpG meta-analysis--DMR calling from meta CpG signal
+
+rm(list = ls())
+options(timeout = 100000) 
+options(scipen = 20)
+
+library(data.table)
+library(limma)
+library(metafor)
+
+load("step0.1-GSE199057_output.Rdata")
+g_GSE199057 <- myLoad$beta
+g_GSE199057_group <- myLoad$pd
+rm(myLoad)
+g1 <- g_GSE199057
+pd1 <- g_GSE199057_group
+
+load("step0.2-GSE149282_output.Rdata")
+g_GSE149282 <- myLoad$beta
+g_GSE149282_group <- myLoad$pd
+rm(myLoad)
+g2 <-g_GSE149282
+pd2 <- g_GSE149282_group
+
+load("step0.3-GSE119526_output.Rdata")
+g_GSE119526 <- myLoad$beta
+g_GSE119526_group <- myLoad$pd
+rm(myLoad)
+g3 <-g_GSE119526
+pd3 <- g_GSE119526_group
+
+dim(g1)
+dim(g2)
+dim(g3)
+
+dim(pd1)
+dim(pd2)
+dim(pd3)
+
+colnames(pd1)
+colnames(pd2)
+colnames(pd3)
+
+head(pd1);tail(pd1)
+head(pd2);tail(pd2)
+head(pd3);tail(pd3)
+
+# unify CpG space
+common_cpg <- Reduce(intersect, list(
+    rownames(g1),
+    rownames(g2),
+    rownames(g3)
+  ))
+
+g1 <- g1[common_cpg, ]
+g2 <- g2[common_cpg, ]
+g3 <- g3[common_cpg, ]
+
+all(colnames(g1) == pd1$ID)
+all(colnames(g2) == pd2$ID)
+all(colnames(g3) == pd3$ID)
+
+# build phenotype
+group1 <- factor(pd1$group, levels = c("Normal", "Tumor"))
+group2 <- factor(pd2$group, levels = c("Normal", "Tumor"))
+group3 <- factor(pd3$group, levels = c("Normal", "Tumor"))
+
+## LIMMA per dataset
+
+run_limma <- function(beta, group){
+  
+  beta <- as.matrix(beta)
+  
+  # Fixed effect direction: Tumor - Normal
+  group <- factor(group, levels = c("Normal", "Tumor"))
+  
+  stopifnot(ncol(beta) == length(group))
+  stopifnot(!any(is.na(group)))
+  
+  # Prevent beta values of 0 or 1 from producing infinite M values
+  beta <- pmin(pmax(beta, 1e-6), 1 - 1e-6)
+  
+  # Convert beta values to M values
+  mval <- log2(beta / (1 - beta))
+  
+  # Use a no-intercept design to explicitly define Tumor - Normal
+  design <- model.matrix(~ 0 + group)
+  colnames(design) <- levels(group)
+  
+  contrast.matrix <- makeContrasts(
+    Tumor_vs_Normal = Tumor - Normal,
+    levels = design
+  )
+  
+  fit <- lmFit(mval, design)
+  fit <- contrasts.fit(fit, contrast.matrix)
+  fit <- eBayes(fit)
+  
+  res <- topTable(
+    fit,
+    coef = "Tumor_vs_Normal",
+    number = Inf,
+    sort.by = "none"
+  )
+  
+  # CpG ID
+  res$CpG <- rownames(res)
+  
+  # Manually calculate standard error
+  se_vec <- sqrt(fit$s2.post) * fit$stdev.unscaled[, "Tumor_vs_Normal"]
+  names(se_vec) <- rownames(fit$coefficients)
+  res$SE <- se_vec[res$CpG]
+  
+  # Retain delta beta for biological interpretation
+  res$deltaBeta <- rowMeans(beta[, group == "Tumor", drop = FALSE]) -
+    rowMeans(beta[, group == "Normal", drop = FALSE])
+  
+  return(res)
+}
+res1 <- run_limma(g1, group1)
+res2 <- run_limma(g2, group2)
+res3 <- run_limma(g3, group3)
+
+# CpG meta-analysis
+meta_df <- data.frame(
+  CpG = res1$CpG,
+  
+  beta1 = res1$logFC,
+  se1   = res1$SE,
+  
+  beta2 = res2$logFC,
+  se2   = res2$SE,
+  
+  beta3 = res3$logFC,
+  se3   = res3$SE
+)
+## meta-analysis per CpG
+## fixed-effect meta-analysis per CpG
+
+b1 <- meta_df$beta1
+b2 <- meta_df$beta2
+b3 <- meta_df$beta3
+
+s1 <- meta_df$se1
+s2 <- meta_df$se2
+s3 <- meta_df$se3
+
+## inverse-variance weights
+w1 <- 1 / s1^2
+w2 <- 1 / s2^2
+w3 <- 1 / s3^2
+
+## fixed-effect pooled beta
+beta_meta <- (w1 * b1 + w2 * b2 + w3 * b3) / (w1 + w2 + w3)
+
+## pooled standard error
+se_meta <- sqrt(1 / (w1 + w2 + w3))
+
+## z statistic
+z_meta <- beta_meta / se_meta
+
+## two-sided p value
+p_meta <- 2 * pnorm(abs(z_meta), lower.tail = FALSE)
+
+## output
+meta_res_fixed <- data.frame(
+  CpG = meta_df$CpG,
+  beta = beta_meta,
+  se = se_meta,
+  z = z_meta,
+  p = p_meta
+)
+
+## FDR correction
+meta_res_fixed$FDR <- p.adjust(meta_res_fixed$p, method = "BH")
+
+############################################################
+## DMR calling 
+############################################################
+## Custom meta-DMR calling from meta CpG signal
+## Criteria:
+## 1. CpG-level meta FDR < 0.05
+## 2. Adjacent significant CpGs within 1000 bp are merged
+## 3. DMR CpGs > 5
+## 4. DMR mean Δβ > 0.2
+
+library(data.table)
+library(minfi)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+## 1. Annotation
+
+ann <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+ann_df <- data.frame(
+  CpG = rownames(ann),
+  chr = as.character(ann$chr),
+  pos = as.integer(ann$pos),
+  gene = as.character(ann$UCSC_RefGene_Name),
+  relation_to_island = as.character(ann$Relation_to_Island),
+  stringsAsFactors = FALSE
+)
+
+## 2. Prepare mean delta beta
+## deltaBeta direction: Tumor - Normal
+
+delta_df <- Reduce(function(x, y) merge(x, y, by = "CpG", all = FALSE), list(
+  data.frame(CpG = res1$CpG, deltaBeta1 = res1$deltaBeta),
+  data.frame(CpG = res2$CpG, deltaBeta2 = res2$deltaBeta),
+  data.frame(CpG = res3$CpG, deltaBeta3 = res3$deltaBeta)
+))
+
+delta_df$mean_deltaBeta <- rowMeans(
+  delta_df[, c("deltaBeta1", "deltaBeta2", "deltaBeta3")],
+  na.rm = TRUE
+)
+
+## 3. Merge meta result + annotation + delta beta
+
+dat <- merge(meta_res_fixed, ann_df, by = "CpG")
+dat <- merge(dat, delta_df[, c("CpG", "mean_deltaBeta")], by = "CpG")
+
+dat <- dat[
+  is.finite(dat$beta) &
+    is.finite(dat$se) &
+    is.finite(dat$z) &
+    is.finite(dat$p) &
+    is.finite(dat$FDR) &
+    is.finite(dat$mean_deltaBeta) &
+    !is.na(dat$chr) &
+    !is.na(dat$pos),
+]
+
+dat <- dat[dat$chr %in% paste0("chr", 1:22), ]
+
+dat <- as.data.table(dat)
+
+## 4. Define significant CpGs for DMR seed
+## Hyper-DMR: Tumor - Normal > 0
+sig <- dat[
+  FDR < 0.05 &
+    mean_deltaBeta > 0
+]
+
+sig[, chr_order := match(chr, paste0("chr", 1:22))]
+setorder(sig, chr_order, pos)
+
+## 5. Merge nearby significant CpGs into regions
+## gap <= 1000 bp belongs to the same region
+max_gap <- 1000
+
+sig[, gap := pos - data.table::shift(pos, n = 1L, type = "lag"), by = chr]
+sig[, new_region := is.na(gap) | gap > max_gap, by = chr]
+sig[, region_id := cumsum(new_region)]
+
+## 6. Summarize candidate DMRs
+dmr_custom <- sig[
+  ,
+  .(
+    chr = chr[1],
+    start = min(pos),
+    end = max(pos),
+    width = max(pos) - min(pos) + 1,
+    no.cpgs = .N,
+    mean_deltaBeta = mean(mean_deltaBeta, na.rm = TRUE),
+    max_deltaBeta = max(mean_deltaBeta, na.rm = TRUE),
+    min_deltaBeta = min(mean_deltaBeta, na.rm = TRUE),
+    min_FDR = min(FDR, na.rm = TRUE),
+    mean_FDR = mean(FDR, na.rm = TRUE),
+    min_p = min(p, na.rm = TRUE),
+    mean_z = mean(z, na.rm = TRUE),
+    CpGs = paste(CpG, collapse = ";"),
+    genes = paste(
+      base::unique(
+        base::unlist(
+          base::strsplit(paste(gene, collapse = ";"), ";")
+        )
+      ),
+      collapse = ";"
+    ),
+    relation_to_island = paste(base::unique(relation_to_island), collapse = ";")
+  ),
+  by = region_id
+]
+
+## 7. Final filter: CpGs > 5 and mean Δβ > 0.2
+dmr_hyper_custom <- dmr_custom[
+  no.cpgs > 5 &
+    mean_deltaBeta > 0.2
+]
+
+setorder(dmr_hyper_custom, min_FDR, -mean_deltaBeta)
+
+dmr_hyper_custom
+save(dmr_hyper_custom,file = "dmr_hyper_custom.Rdata")
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
