@@ -1,0 +1,568 @@
+---
+title: "450k_independent_validation"
+author: "YC"
+date: "2026-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## data preprocessing
+## GSE42752
+```{r GSE42752}
+###############################################
+## GSE42752 450k methylation processed matrix pipeline
+## Goal:1.get standard beta value matrix
+##      2.Build phenotype table pD
+##      3. Run ChAMP filtering.
+############################################################
+
+############################################################
+## Module 0. Clear environment and load required packages
+############################################################
+rm(list = ls())
+options(timeout = 100000) 
+options(scipen = 20)
+options(stringsAsFactors = F)
+require(GEOquery)
+require(Biobase)
+library("impute")
+library(ChAMP)
+
+############################################################
+## Module 1. Read GEO metadata
+#Ensure that the methylation beta matrix and the phenotype information strictly correspond to each other
+## Download/read GEO series matrix metadata.
+eset <- getGEO("GSE42752",destdir = './',AnnotGPL = T,getGPL = F)
+beta.m <- exprs(eset[[1]])
+class(beta.m)
+dim(beta.m)
+############################################################
+## Module 2. Build phenotype table pD
+
+## Build a clean phenotype table.
+## Modify this part when applying the pipeline to another dataset
+pD.all <- pData(eset[[1]])
+pD <- pD.all[,c(37,2)]
+names(pD) <- c("group", "ID")
+pD$group <- ifelse(grepl("normal",pD$group,ignore.case = T),
+  "Normal","Tumor")
+
+#⭐Check if the extracted groupings are correct
+check_df <- data.frame(Title = pD.all$`tissue:ch1`, Group = pD$group)
+head(check_df, 10)
+tail(check_df,10)
+table(pD$group)
+
+
+############################################################
+## Module 3. Align pD with beta.m
+############################################################
+
+## Check whether beta.m and pD contain the same sample set.
+## setequal() ignores order.
+identical(rownames(pD),colnames(beta.m))##This must be TRUE before champ.filter().
+setequal(colnames(beta.m), pD$ID)
+# Confirm that there are no duplicated sample names
+sum(duplicated(colnames(beta.m)))
+sum(duplicated(pD$ID))
+
+# Set pD row names as GSM IDs.
+rownames(pD) <- pD$ID
+## Final strict alignment check.
+dim(beta.m)
+dim(pD)
+
+# Set group order
+pD$group <- factor(
+  pD$group,
+  levels = c("Normal", "Tumor"))
+
+# Sort pD by group
+sample_order <- order(pD$group)
+
+pD <- pD[sample_order, , drop = FALSE]
+
+# Reorder beta matrix columns according to pD
+beta.m <- beta.m[, rownames(pD), drop = FALSE]
+
+############################################################
+## Module 4. Run ChAMP filtering
+############################################################
+
+## Run ChAMP filtering using the cleaned beta matrix and aligned pD.
+myLoad <- champ.filter(beta = beta.m, pd = pD, arraytype = "450k")
+## Save the ChAMP object for downstream analysis.
+saveRDS(myLoad, file = "step0.1-GSE42752_output.rds")
+#myLoad <- readRDS("step0.1-GSE42752_output.rds")
+
+# For all downstream analyses, simply use this myLoad variable
+#champ.filter() performs initial quality control:
+#(1).Filters out probes with low detection p-value.
+#(2).Removes probes with missing values.
+#(3).Filters sex chromosomes or SNP-associated probes if needed.
+#(4).The output myLoad is an object used for all downstream ChAMP analyses 
+##(normalization, DMP, DMR, pathway analysis).
+
+
+```
+
+## Independent validation of discovery hyper-DMRs in 450k datasets-GSE42752
+```{r}
+############################################################
+## Independent validation of discovery hyper-DMRs in GSE42752
+## Validation direction:
+##   Tumor - Normal
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+############################################################
+## 0. Load required packages
+############################################################
+
+library(data.table)
+library(GenomicRanges)
+library(IRanges)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+############################################################
+## 1. Load discovery DMRs
+############################################################
+
+load("dmr_hyper_custom.Rdata")
+dD <- as.data.frame(dmr_hyper_custom)
+
+## Basic coordinate check
+stopifnot(all(c("chr", "start", "end") %in% colnames(dD)))
+
+## Add DMR ID
+dD$DMR_ID <- paste0("DMR_", dD$region_id)
+
+## Keep discovery delta beta
+dD$discovery_deltaBeta <- dD$mean_deltaBeta
+
+############################################################
+## 2. Load GSE42752 filtered beta matrix and phenotype
+############################################################
+
+dataset_name <- "GSE42752"
+
+myLoad <- readRDS("step0.1-GSE42752_output.rds")
+
+beta_val <- myLoad$beta
+pd_val <- myLoad$pd
+
+############################################################
+## 3. Check and align phenotype with beta matrix
+############################################################
+## Phenotype is already aligned with beta matrix
+stopifnot(identical(colnames(beta_val), rownames(pd_val)))
+
+## Standardize group variable
+pd_val$group <- factor(
+  as.character(pd_val$group),
+  levels = c("Normal", "Tumor")
+)
+
+## Build group list
+group_list <- pd_val$group
+names(group_list) <- rownames(pd_val)
+
+## Extract Normal and Tumor sample IDs
+normal_samples <- names(group_list)[group_list == "Normal"]
+tumor_samples  <- names(group_list)[group_list == "Tumor"]
+
+## Check sample numbers
+table(group_list)
+############################################################
+## 4. Standardize genomic coordinates
+############################################################
+
+fix_chr <- function(x) {
+  x <- as.character(x)
+  x <- gsub("^chr", "", x, ignore.case = TRUE)
+  x[x == "23"] <- "X"
+  x[x == "24"] <- "Y"
+  x[x %in% c("M", "MT")] <- "M"
+  paste0("chr", x)
+}
+
+dD$chr <- fix_chr(dD$chr)
+dD$start <- as.numeric(dD$start)
+dD$end <- as.numeric(dD$end)
+
+dD <- dD[
+  !is.na(dD$chr) &
+    !is.na(dD$start) &
+    !is.na(dD$end),
+]
+
+dD <- dD[dD$chr %in% paste0("chr", 1:22), ]
+
+############################################################
+## 5. Load 450K annotation and map CpGs to genomic positions
+############################################################
+
+anno <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+anno <- as.data.frame(anno)
+anno$CpG <- rownames(anno)
+
+anno <- anno[anno$CpG %in% rownames(beta_val), ]
+
+anno$chr <- fix_chr(anno$chr)
+anno$pos <- as.numeric(anno$pos)
+
+anno <- anno[
+  !is.na(anno$chr) &
+    !is.na(anno$pos) &
+    anno$chr %in% paste0("chr", 1:22),
+]
+
+common_cpgs <- intersect(rownames(beta_val), anno$CpG)
+
+beta_val <- beta_val[common_cpgs, , drop = FALSE]
+anno <- anno[match(common_cpgs, anno$CpG), ]
+
+stopifnot(identical(rownames(beta_val), anno$CpG))
+
+############################################################
+## 6. Convert CpGs and DMRs into GRanges objects
+############################################################
+
+cpg_gr <- GRanges(
+  seqnames = anno$chr,
+  ranges = IRanges(start = anno$pos, end = anno$pos),
+  CpG = anno$CpG
+)
+
+dmr_gr <- GRanges(
+  seqnames = dD$chr,
+  ranges = IRanges(start = dD$start, end = dD$end),
+  DMR_ID = dD$DMR_ID
+)
+
+############################################################
+## 7. Identify CpGs located within each discovery DMR
+############################################################
+
+hits <- findOverlaps(dmr_gr, cpg_gr)
+
+dmr_cpg_list <- split(
+  mcols(cpg_gr)$CpG[subjectHits(hits)],
+  queryHits(hits)
+)
+
+############################################################
+## 8. Calculate DMR-level beta values and validation delta beta
+############################################################
+
+validation_results <- dD
+
+validation_results$dataset <- dataset_name
+validation_results$nCpG <- 0
+validation_results$meanBeta_Normal <- NA_real_
+validation_results$meanBeta_Tumor <- NA_real_
+validation_results$deltaBeta_validation <- NA_real_
+validation_results$p.value <- NA_real_
+
+dmr_beta <- matrix(
+  NA_real_,
+  nrow = nrow(dD),
+  ncol = ncol(beta_val),
+  dimnames = list(dD$DMR_ID, colnames(beta_val))
+)
+
+for (i in seq_len(nrow(dD))) {
+  
+  cpgs <- dmr_cpg_list[[as.character(i)]]
+  
+  if (is.null(cpgs)) {
+    next
+  }
+  
+  cpgs <- unique(intersect(cpgs, rownames(beta_val)))
+  
+  validation_results$nCpG[i] <- length(cpgs)
+  
+  if (length(cpgs) < 1) {
+    next
+  }
+  
+  dmr_value <- colMeans(beta_val[cpgs, , drop = FALSE], na.rm = TRUE)
+  
+  dmr_beta[i, ] <- dmr_value
+  
+  normal_value <- dmr_value[normal_samples]
+  tumor_value  <- dmr_value[tumor_samples]
+  
+  validation_results$meanBeta_Normal[i] <- mean(normal_value, na.rm = TRUE)
+  validation_results$meanBeta_Tumor[i] <- mean(tumor_value, na.rm = TRUE)
+  
+  validation_results$deltaBeta_validation[i] <-
+    mean(tumor_value, na.rm = TRUE) - mean(normal_value, na.rm = TRUE)
+  
+  validation_results$p.value[i] <- tryCatch(
+    wilcox.test(
+      tumor_value,
+      normal_value,
+      alternative = "greater",
+      exact = FALSE
+    )$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+############################################################
+## 9. Define validation labels
+############################################################
+validation_results$FDR <- p.adjust(
+  validation_results$p.value,
+  method = "BH"
+)
+
+## Same direction: Tumor higher than Normal
+validation_results$same_trend <- 
+  validation_results$deltaBeta_validation > 0
+
+## Direction + moderate effect
+validation_results$same_trend_delta_0.10 <- 
+  validation_results$deltaBeta_validation > 0.10
+
+## Direction + strong effect, comparable to discovery threshold
+validation_results$same_trend_delta_0.20 <- 
+  validation_results$deltaBeta_validation > 0.20
+
+## Direction + nominal significance
+validation_results$validated_p005 <-
+  validation_results$same_trend & 
+  validation_results$p.value < 0.05
+
+## Direction + FDR significance
+validation_results$validated_FDR005 <- 
+  validation_results$same_trend & 
+  validation_results$FDR < 0.05
+
+## Main validation criterion:
+## CpG coverage > 5, validation delta beta > 0.2, and nominal p < 0.05
+validation_results$validated_strict <-
+  validation_results$nCpG > 5 &
+  validation_results$deltaBeta_validation > 0.20 &
+  validation_results$p.value < 0.05
+
+## More stringent version using FDR
+validation_results$validated_strict_FDR <-
+  validation_results$nCpG > 5 &
+  validation_results$deltaBeta_validation > 0.20 &
+  validation_results$FDR < 0.05
+
+############################################################
+## 10. Summarize validation results
+############################################################
+
+summary_validation <- data.frame(
+  dataset = dataset_name,
+  
+  Total_discovery_hyper_DMRs = nrow(validation_results),
+  
+  DMRs_with_CpG_overlap = sum(
+    validation_results$nCpG > 0,
+    na.rm = TRUE
+  ),
+  
+  DMRs_with_more_than_5_CpGs = sum(
+    validation_results$nCpG > 5,
+    na.rm = TRUE
+  ),
+  
+  Same_trend_DMRs = sum(
+    validation_results$same_trend,
+    na.rm = TRUE
+  ),
+  
+  Same_trend_percent_among_overlap = round(
+    100 * mean(
+      validation_results$same_trend[validation_results$nCpG > 0],
+      na.rm = TRUE
+    ),
+    2
+  ),
+  
+  Same_trend_delta_0.10 = sum(
+    validation_results$same_trend_delta_0.10,
+    na.rm = TRUE
+  ),
+  
+  Same_trend_delta_0.20 = sum(
+    validation_results$same_trend_delta_0.20,
+    na.rm = TRUE
+  ),
+  
+  Validated_p005 = sum(
+    validation_results$validated_p005,
+    na.rm = TRUE
+  ),
+  
+  Validated_FDR005 = sum(
+    validation_results$validated_FDR005,
+    na.rm = TRUE
+  ),
+  
+  Validated_strict = sum(
+    validation_results$validated_strict,
+    na.rm = TRUE
+  ),
+  
+  Validated_strict_FDR = sum(
+    validation_results$validated_strict_FDR,
+    na.rm = TRUE
+  )
+)
+
+validated_hyper_dmrs <- validation_results[
+  validation_results$validated_strict == TRUE,
+]
+############################################################
+## 11. Save final outputs
+############################################################
+## Strict validated DMRs:
+## nCpG > 5, validation delta beta > 0.20, and nominal p < 0.05
+validated_hyper_dmrs <- validation_results[
+  validation_results$validated_strict == TRUE,
+]
+
+## More stringent FDR-based validated DMRs:
+## nCpG > 5, validation delta beta > 0.20, and FDR < 0.05
+validated_hyper_dmrs_FDR <- validation_results[
+  validation_results$validated_strict_FDR == TRUE,
+]
+
+write.csv(
+  validation_results,
+  file = paste0(dataset_name, "_validation_results_all_DMRs.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  summary_validation,
+  file = paste0(dataset_name, "_validation_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  validated_hyper_dmrs,
+  file = paste0(dataset_name, "_validated_hyper_DMRs_strict_p005.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  validated_hyper_dmrs_FDR,
+  file = paste0(dataset_name, "_validated_hyper_DMRs_strict_FDR005.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  list(
+    dD = dD,
+    beta_val = beta_val,
+    pd_val = pd_val,
+    group_list = group_list,
+    dmr_beta = dmr_beta,
+    validation_results = validation_results,
+    summary_validation = summary_validation,
+    validated_hyper_dmrs = validated_hyper_dmrs,
+    validated_hyper_dmrs_FDR = validated_hyper_dmrs_FDR
+  ),
+  file = paste0("step1-", dataset_name, "-validation-output.rds")
+)
+
+print(summary_validation)
+############################################################
+## 12. Plot validation summary
+############################################################
+
+library(ggplot2)
+
+validation_count_df <- data.frame(
+  Criterion = c(
+    "Discovery hyper-DMRs",
+    "CpG overlap",
+    "nCpG > 5",
+    "Same direction",
+    "Δβ > 0.10",
+    "Δβ > 0.20",
+    "Direction + P < 0.05",
+    "Direction + FDR < 0.05",
+    "Strict P < 0.05",
+    "Strict FDR < 0.05"
+  ),
+  Count = c(
+    summary_validation$Total_discovery_hyper_DMRs,
+    summary_validation$DMRs_with_CpG_overlap,
+    summary_validation$DMRs_with_more_than_5_CpGs,
+    summary_validation$Same_trend_DMRs,
+    summary_validation$Same_trend_delta_0.10,
+    summary_validation$Same_trend_delta_0.20,
+    summary_validation$Validated_p005,
+    summary_validation$Validated_FDR005,
+    summary_validation$Validated_strict,
+    summary_validation$Validated_strict_FDR
+  )
+)
+
+validation_count_df$Percent <- round(
+  100 * validation_count_df$Count /
+    summary_validation$Total_discovery_hyper_DMRs,
+  2
+)
+
+validation_count_df$Label <- paste0(
+  validation_count_df$Count,
+  " (",
+  validation_count_df$Percent,
+  "%)"
+)
+
+validation_count_df$Criterion <- factor(
+  validation_count_df$Criterion,
+  levels = rev(validation_count_df$Criterion)
+)
+
+p <- ggplot(validation_count_df, aes(x = Criterion, y = Count)) +
+  geom_col(fill = "grey70", color = "black") +
+  geom_text(aes(label = Label), hjust = -0.05, size = 3.5) +
+  coord_flip() +
+  ylim(0, max(validation_count_df$Count) * 1.18) +
+  theme_bw() +
+  labs(
+    title = paste0(dataset_name, " independent validation summary"),
+    x = NULL,
+    y = "Number of DMRs"
+  )
+
+print(p)
+
+ggsave(
+  paste0(dataset_name, "_validation_summary_barplot.png"),
+  plot = p,
+  width = 9,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
