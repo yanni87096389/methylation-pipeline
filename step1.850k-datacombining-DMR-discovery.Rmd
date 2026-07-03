@@ -8,35 +8,66 @@ output: html_document
 ```{r setup, include=FALSE, message=FALSE, warning=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
-## data preprocessing-standard beta value matrix and pd group information
-### GSE199057
-```{r GSE199057}
-## GSE199057 EPIC methylation processed matrix pipeline
-##   1. Read GEO metadata.
-##   2. Build phenotype table pD.
-##   3. Extract AVG_Beta columns from the processed matrix.
-##   4. Map processed sample IDs to GSM IDs.
-##   5. Remove plate-control samples.
-##   6. Generate a strict beta matrix: CpG probes × GSM samples.
-##   7. Remove probes with missing beta values.
-##   8. Align pD rows with beta matrix columns.
-##   9. Run ChAMP filtering.
+# Data preprocessing-standard beta value matrix and pd group information
 
-############################################################
-## Module 0. Clear environment and load required packages
-############################################################
+## GSE199057
+
+Here we will process methylation data from GSE199057.
+
+The pipeline structure is given below:
+
+GSE199057 EPIC methylation processed matrix pipeline
+
+1. Read GEO metadata.
+
+2. Build phenotype table pD.
+
+3. Extract AVG_Beta columns from the processed matrix.
+
+4. Map processed sample IDs to GSM IDs.
+
+5. Remove plate-control samples.
+
+6. Generate a strict beta matrix: CpG probes  ^w GSM samples.
+
+7. Remove probes with missing beta values.
+
+8. Align pD rows with beta matrix columns.
+
+9. Run ChAMP filtering.
+
+## Load libraries
+
+Module 0. Clear environment and load required packages
+
+
+```{r loadlibraries}
+
 rm(list = ls())
 options(stringsAsFactors = F)
 require(GEOquery)
 require(Biobase)
 library("impute")
-library(ChAMP)
+library("ChAMP")
+library("data.table")
+library("limma")
+library("metafor")
+library("minfi")
+library("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+library("kableExtra")
+
+```
+
+## Read GEO Metadata
+
+```{r GSE199057}
 
 ############################################################
 ## Module 1. Read GEO metadata
 ############################################################
 # Ensure that the methylation beta matrix and the phenotype information strictly correspond to each other
 # Download/read GEO series matrix metadata.
+# GEOquery package
 eset <- getGEO("GSE199057",destdir = './',AnnotGPL = T,getGPL = F)
 #beta.m <- exprs(eset[[1]])
 
@@ -73,7 +104,14 @@ table(pd$group)
 ##   sample_id.AVG_Beta
 ##   sample_id.Detection Pval
 #beta.m <- exprs(eset[[1]])
-library(data.table)
+GSE199057_DATA="GSE199057_processed_methlyation_matrix.txt.gz"
+GSE199057_URL="https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE199057&format=file&file=GSE199057%5Fprocessed%5Fmethlyation%5Fmatrix%2Etxt%2Egz"
+
+if ( ! file.exists(GSE199057_DATA) ) {
+  options(timeout = 300)
+  download.file(GSE199057_URL,destfile=GSE199057_DATA)
+}
+
 beta.m <- fread("GSE199057_processed_methlyation_matrix.txt.gz",data.table = F)
 dim(beta.m)
 ############################################################
@@ -173,7 +211,7 @@ colnames(beta) <- beta_to_GSM_clean$GSM## Set GSM IDs as column names.
 ##   rows = CpG probes
 ##   columns = biological GSM samples
 ##   values = beta values between 0 and 1
-dim(beta)#224 samples
+dim(beta) #224 samples
 beta.m1 <- beta
 ############################################################
 ## Module 8. Align pD with beta.m1
@@ -241,17 +279,17 @@ save(myLoad,file = 'step0.1-GSE199057_output.Rdata')
 #(3).Filters sex chromosomes or SNP-associated probes if needed.
 #(4).The output myLoad is an object used for all downstream ChAMP analyses 
 ##(normalization, DMP, DMR, pathway analysis).
+
 ```
 
-### GSE149282
+## GSE149282
+
 ```{r GSE149282}
 ## Module 0. Clear environment and load required packages
 rm(list = ls())
 options(stringsAsFactors = F)
 require(GEOquery)
 require(Biobase)
-library("impute")
-library(ChAMP)
 
 ############################################################
 ## Module 1. Read GEO metadata
@@ -323,14 +361,14 @@ save(myLoad,file = 'step0.2-GSE149282_output.Rdata')
 ```
 
 ### GSE119526
+
 ```{r GSE119526}
+
 rm(list = ls())
 options(stringsAsFactors = F)
 
 require(GEOquery)
 require(Biobase)
-library("impute")
-library(ChAMP)
 
 # Make sure that the methylation beta matrix and phenotype information correspond one-to-one.
 eset <- getGEO("GSE119526", destdir = './', AnnotGPL = T, getGPL = F)
@@ -392,9 +430,6 @@ rm(list = ls())
 options(timeout = 100000) 
 options(scipen = 20)
 
-library(data.table)
-library(limma)
-library(metafor)
 
 load("step0.1-GSE199057_output.Rdata")
 g_GSE199057 <- myLoad$beta
@@ -456,69 +491,84 @@ group3 <- factor(pd3$group, levels = c("Normal", "Tumor"))
 ## LIMMA per dataset
 
 run_limma <- function(beta, group){
-  
+
   beta <- as.matrix(beta)
-  
+
   # Fixed effect direction: Tumor - Normal
   group <- factor(group, levels = c("Normal", "Tumor"))
-  
+
   stopifnot(ncol(beta) == length(group))
   stopifnot(!any(is.na(group)))
-  
+
   # Prevent beta values of 0 or 1 from producing infinite M values
   beta <- pmin(pmax(beta, 1e-6), 1 - 1e-6)
-  
+
   # Convert beta values to M values
   mval <- log2(beta / (1 - beta))
-  
+
   # Use a no-intercept design to explicitly define Tumor - Normal
   design <- model.matrix(~ 0 + group)
   colnames(design) <- levels(group)
-  
+
   contrast.matrix <- makeContrasts(
     Tumor_vs_Normal = Tumor - Normal,
     levels = design
   )
-  
+
   fit <- lmFit(mval, design)
   fit <- contrasts.fit(fit, contrast.matrix)
   fit <- eBayes(fit)
-  
+
   res <- topTable(
     fit,
     coef = "Tumor_vs_Normal",
     number = Inf,
     sort.by = "none"
   )
-  
+
   # CpG ID
   res$CpG <- rownames(res)
-  
+
   # Manually calculate standard error
   se_vec <- sqrt(fit$s2.post) * fit$stdev.unscaled[, "Tumor_vs_Normal"]
   names(se_vec) <- rownames(fit$coefficients)
   res$SE <- se_vec[res$CpG]
-  
+
   # Retain delta beta for biological interpretation
   res$deltaBeta <- rowMeans(beta[, group == "Tumor", drop = FALSE]) -
     rowMeans(beta[, group == "Normal", drop = FALSE])
-  
+
   return(res)
 }
 res1 <- run_limma(g1, group1)
 res2 <- run_limma(g2, group2)
 res3 <- run_limma(g3, group3)
 
+# check no significant probes
+nrow(subset(res1,logFC>0 & adj.P.Val<0.05))
+nrow(subset(res1,logFC<0 & adj.P.Val<0.05))
+
+nrow(subset(res2,logFC>0 & adj.P.Val<0.05))
+nrow(subset(res2,logFC<0 & adj.P.Val<0.05))
+
+nrow(subset(res3,logFC>0 & adj.P.Val<0.05))
+nrow(subset(res3,logFC<0 & adj.P.Val<0.05))
+
+# check similarity between
+cor(res1$logFC,res2$logFC,use="complete.obs")
+cor(res1$logFC,res3$logFC,use="complete.obs")
+cor(res2$logFC,res3$logFC,use="complete.obs")
+
 # CpG meta-analysis
 meta_df <- data.frame(
   CpG = res1$CpG,
-  
+
   beta1 = res1$logFC,
   se1   = res1$SE,
-  
+
   beta2 = res2$logFC,
   se2   = res2$SE,
-  
+
   beta3 = res3$logFC,
   se3   = res3$SE
 )
@@ -562,9 +612,11 @@ meta_res_fixed <- data.frame(
 ## FDR correction
 meta_res_fixed$FDR <- p.adjust(meta_res_fixed$p, method = "BH")
 
-############################################################
+```
 ## DMR calling 
-############################################################
+
+```{r, dmrcalling}
+
 ## Custom meta-DMR calling from meta CpG signal
 ## Criteria:
 ## 1. CpG-level meta FDR < 0.05
@@ -572,9 +624,6 @@ meta_res_fixed$FDR <- p.adjust(meta_res_fixed$p, method = "BH")
 ## 3. DMR CpGs > 5
 ## 4. DMR mean Δβ > 0.2
 
-library(data.table)
-library(minfi)
-library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
 
 ## 1. Annotation
 
@@ -622,6 +671,10 @@ dat <- dat[
 dat <- dat[dat$chr %in% paste0("chr", 1:22), ]
 
 dat <- as.data.table(dat)
+
+head(dat,10) |>
+  kbl(caption="CpG data") |>
+  kable_paper("hover", full_width = F)
 
 ## 4. Define significant CpGs for DMR seed
 ## Hyper-DMR: Tumor - Normal > 0
@@ -671,6 +724,12 @@ dmr_custom <- sig[
   by = region_id
 ]
 
+head(dmr_custom,10) |>
+  kbl(caption="DMR data") |>
+  kable_paper("hover", full_width = F)
+
+dim(dmr_custom)
+
 ## 7. Final filter: CpGs > 5 and mean Δβ > 0.2
 dmr_hyper_custom <- dmr_custom[
   no.cpgs > 5 &
@@ -679,16 +738,23 @@ dmr_hyper_custom <- dmr_custom[
 
 setorder(dmr_hyper_custom, min_FDR, -mean_deltaBeta)
 
-dmr_hyper_custom
+head(dmr_hyper_custom,10) |>
+  kbl(caption="DMR hyper") |>
+  kable_paper("hover", full_width = F)
+
+dim(dmr_hyper_custom)
+
+#dmr_hyper_custom
 save(dmr_hyper_custom,file = "dmr_hyper_custom.Rdata")
+
 ```
 
-## Including Plots
+## Session information
 
-You can also embed plots, for example:
+For reproducibility.
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r sessioninfo}
+
+sessionInfo()
+
 ```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
