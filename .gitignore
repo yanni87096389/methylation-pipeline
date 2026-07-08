@@ -1,0 +1,24 @@
+# R session / project files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Large raw methylation / GEO / TCGA data
+*.tsv.gz
+*.txt.gz
+*.idat
+*.idat.gz
+
+# R binary outputs
+*.Rdata
+*.RData
+*.rds
+*.RDS
+
+# Logs
+*.log
+
+# Temporary/cache files
+*.tmp
+*.cache

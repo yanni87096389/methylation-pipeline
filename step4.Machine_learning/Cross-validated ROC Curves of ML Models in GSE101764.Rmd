@@ -1,0 +1,238 @@
+---
+title: "Cross-validated ROC Curves of ML Models in GSE101764"
+author: "YC"
+date: "2026-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 6,
+  dpi = 300
+)
+library(ggplot2)
+library(pROC)
+library(dplyr)
+library(data.table)
+```
+
+## Load trained ML models
+
+```{r}
+## Change this path if your Rdata file is saved somewhere else
+model_rdata_file <- "GSE101764_ML_training_110DMRs/GSE101764_ML_training_3models_110DMRs.Rdata"
+
+if (!file.exists(model_rdata_file)) {
+  stop(paste0("Model Rdata file not found: ", model_rdata_file))
+}
+
+load(model_rdata_file)
+
+## Check whether the three trained models are loaded correctly
+exists("model_glmnet")
+exists("model_rf")
+exists("model_svm")
+```
+
+## Extract cross-validated predictions
+```{r}
+get_best_predictions <- function(model) {
+  
+  pred <- model$pred
+  best <- model$bestTune
+  
+  for (cn in colnames(best)) {
+    pred <- pred[pred[[cn]] == best[[cn]], , drop = FALSE]
+  }
+  
+  return(pred)
+}
+
+pred_glmnet <- get_best_predictions(model_glmnet)
+pred_rf <- get_best_predictions(model_rf)
+pred_svm <- get_best_predictions(model_svm)
+
+head(pred_glmnet)
+head(pred_rf)
+head(pred_svm)
+```
+
+## Build ROC objects
+```{r}
+## Tumor is treated as the positive class.
+## The column Tumor contains the predicted probability of being Tumor.
+
+roc_glmnet <- roc(
+  response = pred_glmnet$obs,
+  predictor = pred_glmnet$Tumor,
+  levels = c("Normal", "Tumor"),
+  direction = "<",
+  quiet = TRUE
+)
+
+roc_rf <- roc(
+  response = pred_rf$obs,
+  predictor = pred_rf$Tumor,
+  levels = c("Normal", "Tumor"),
+  direction = "<",
+  quiet = TRUE
+)
+
+roc_svm <- roc(
+  response = pred_svm$obs,
+  predictor = pred_svm$Tumor,
+  levels = c("Normal", "Tumor"),
+  direction = "<",
+  quiet = TRUE
+)
+
+auc_glmnet <- as.numeric(auc(roc_glmnet))
+auc_rf <- as.numeric(auc(roc_rf))
+auc_svm <- as.numeric(auc(roc_svm))
+
+auc_summary <- data.frame(
+  Model = c("Elastic-net", "Random Forest", "Radial SVM"),
+  AUC = c(auc_glmnet, auc_rf, auc_svm)
+)
+
+auc_summary
+```
+
+## Prepare ROC data for plotting
+```{r}
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.3f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+}
+
+roc_df <- bind_rows(
+  roc_to_df(roc_glmnet, "Elastic-net", auc_glmnet),
+  roc_to_df(roc_rf, "Random Forest", auc_rf),
+  roc_to_df(roc_svm, "Radial SVM", auc_svm)
+)
+
+head(roc_df)
+```
+
+## ROC curve comparison
+```{r}
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  coord_equal() +
+  labs(
+    title = "Cross-validated ROC curves in GSE101764",
+    x = "False positive rate (1 - Specificity)",
+    y = "True positive rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = c(0.68, 0.20),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 13)
+  )
+
+p_roc
+```
+
+## Save ROC figure
+```{r}
+ggsave(
+  filename = "Figure_ROC_curves_3models_GSE101764.png",
+  plot = p_roc,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = "Figure_ROC_curves_3models_GSE101764.pdf",
+  plot = p_roc,
+  width = 8,
+  height = 6
+)
+auc_summary <- auc_summary %>%
+  arrange(desc(AUC))
+
+auc_summary
+
+```
+
+## Sensitivity and specificity at optimal cutoff
+```{r}
+get_optimal_metrics <- function(roc_obj, pred_df, model_name) {
+  
+  ## Optimal cutoff based on Youden index
+  opt <- coords(
+    roc_obj,
+    x = "best",
+    best.method = "youden",
+    ret = c("threshold", "sensitivity", "specificity"),
+    transpose = FALSE
+  )
+  
+  cutoff <- as.numeric(opt["threshold"])
+  sensitivity <- as.numeric(opt["sensitivity"])
+  specificity <- as.numeric(opt["specificity"])
+  
+  ## Predicted class based on optimal cutoff
+  pred_class <- ifelse(pred_df$Tumor >= cutoff, "Tumor", "Normal")
+  pred_class <- factor(pred_class, levels = c("Tumor", "Normal"))
+  
+  obs_class <- factor(pred_df$obs, levels = c("Tumor", "Normal"))
+  
+  cm <- caret::confusionMatrix(
+    pred_class,
+    obs_class,
+    positive = "Tumor"
+  )
+  
+  data.frame(
+    Model = model_name,
+    AUC = as.numeric(auc(roc_obj)),
+    Cutoff = cutoff,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    stringsAsFactors = FALSE
+  )
+}
+
+performance_table <- rbind(
+  get_optimal_metrics(roc_glmnet, pred_glmnet, "Elastic-net"),
+  get_optimal_metrics(roc_rf, pred_rf, "Random Forest"),
+  get_optimal_metrics(roc_svm, pred_svm, "Radial SVM")
+)
+
+performance_table[, 2:ncol(performance_table)] <- round(
+  performance_table[, 2:ncol(performance_table)],
+  3
+)
+
+performance_table
+data.table::fwrite(
+  performance_table,
+  file = "GSE101764_ROC_optimal_cutoff_performance_table.csv"
+)
+```
+
