@@ -2013,16 +2013,21 @@ capture.output(
 
 ############################################################
 ## Module 15. Plot ROC curves for three models
+## Improved step-style ROC plot
 ############################################################
 
 roc_to_df <- function(roc_obj, model_name, auc_value) {
   
-  data.frame(
+  df <- data.frame(
     FPR = 1 - roc_obj$specificities,
     TPR = roc_obj$sensitivities,
-    Model = paste0(model_name, " (AUC = ", sprintf("%.3f", auc_value), ")"),
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
     stringsAsFactors = FALSE
   )
+  
+  df <- df[order(df$FPR, df$TPR), ]
+  
+  return(df)
 }
 
 roc_df_full <- rbind(
@@ -2047,13 +2052,14 @@ p_roc_full <- ggplot(
   roc_df_full,
   aes(x = FPR, y = TPR, color = Model)
 ) +
-  geom_line(linewidth = 1.2) +
+  geom_step(linewidth = 1.2, direction = "vh") +
   geom_abline(
     slope = 1,
     intercept = 0,
-    linetype = "dashed"
+    linetype = "dashed",
+    color = "black"
   ) +
-  coord_equal() +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
   labs(
     title = "ROC curves in TCGA full cohort",
     x = "False Positive Rate (1 - Specificity)",
@@ -2063,27 +2069,76 @@ p_roc_full <- ggplot(
   theme_bw(base_size = 14) +
   theme(
     plot.title = element_text(hjust = 0.5),
-    legend.position = c(0.65, 0.20),
-    legend.background = element_rect(fill = "white", color = "black")
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
   )
 
 p_roc_full
 
 ggsave(
-  filename = "TCGA_full_ROC_curves_3models.png",
+  filename = "TCGA_full_ROC_curves_3models_improved.png",
   plot = p_roc_full,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_full_ROC_curves_3models_improved.pdf",
+  plot = p_roc_full,
+  width = 8,
+  height = 7
+)
+############################################################
+## Module 15.1. Zoomed ROC plot near top-left corner
+############################################################
+
+p_roc_full_zoom <- ggplot(
+  roc_df_full,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_cartesian(
+    xlim = c(0, 0.10),
+    ylim = c(0.90, 1.00)
+  ) +
+  labs(
+    title = "Zoomed ROC curves in TCGA full cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_full_zoom
+
+ggsave(
+  filename = "TCGA_full_ROC_curves_3models_zoomed.png",
+  plot = p_roc_full_zoom,
   width = 8,
   height = 6,
   dpi = 300
 )
 
 ggsave(
-  filename = "TCGA_full_ROC_curves_3models.pdf",
-  plot = p_roc_full,
+  filename = "TCGA_full_ROC_curves_3models_zoomed.pdf",
+  plot = p_roc_full_zoom,
   width = 8,
   height = 6
 )
-
 ############################################################
 ## Module 16. Plot model performance heatmap
 ############################################################
@@ -2164,6 +2219,73 @@ ggsave(
   plot = p_heat_full,
   width = 9,
   height = 4.5
+)
+
+############################################################
+## Plot predicted Tumor probability distribution
+## More informative when ROC curves are near-perfect
+############################################################
+
+p_prob_full <- ggplot(
+  predictions_full,
+  aes(x = Observed, y = Prob_Tumor, color = Observed, fill = Observed)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.55,
+    alpha = 0.25
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.45,
+    size = 1.4
+  ) +
+  facet_wrap(~ Model, nrow = 1) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "Predicted Tumor probability in TCGA full cohort",
+    x = "Observed group",
+    y = "Predicted probability of Tumor",
+    color = "Observed group",
+    fill = "Observed group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top"
+  )
+
+p_prob_full
+ggsave(
+  filename = "TCGA_full_predicted_Tumor_probability_distribution.png",
+  plot = p_prob_full,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_full_predicted_Tumor_probability_distribution.pdf",
+  plot = p_prob_full,
+  width = 10,
+  height = 5
 )
 ############################################################
 ## Module 17. Save all full TCGA testing objects
@@ -2696,7 +2818,258 @@ ggsave(
   width = 8,
   height = 6
 )
+############################################################
+## Plot ROC curves for TCGA balanced cohort
+## Improved step-style ROC plot
+############################################################
 
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+  
+  df <- df[order(df$FPR, df$TPR), ]
+  
+  return(df)
+}
+
+roc_df_balanced <- rbind(
+  roc_to_df(
+    res_glmnet_balanced$roc,
+    "Elastic-net",
+    res_glmnet_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_balanced$roc,
+    "Random Forest",
+    res_rf_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_balanced$roc,
+    "Radial SVM",
+    res_svm_balanced$performance$AUC
+  )
+)
+
+p_roc_balanced <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_balanced
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models_improved.png",
+  plot = p_roc_balanced,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models_improved.pdf",
+  plot = p_roc_balanced,
+  width = 8,
+  height = 7
+)
+
+############################################################
+## Zoomed ROC plot for TCGA balanced cohort
+############################################################
+
+## Rebuild ROC dataframe using 4 decimal places for AUC
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  df <- data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.4f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+  
+  df <- df[order(df$FPR, df$TPR), ]
+  
+  return(df)
+}
+
+roc_df_balanced <- rbind(
+  roc_to_df(
+    res_glmnet_balanced$roc,
+    "Elastic-net",
+    res_glmnet_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_balanced$roc,
+    "Random Forest",
+    res_rf_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_balanced$roc,
+    "Radial SVM",
+    res_svm_balanced$performance$AUC
+  )
+)
+
+p_roc_balanced_zoom <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_step(linewidth = 1.2, direction = "vh") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  coord_cartesian(
+    xlim = c(0, 0.10),
+    ylim = c(0.90, 1.00)
+  ) +
+  labs(
+    title = "Zoomed ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+p_roc_balanced_zoom
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models_zoomed.png",
+  plot = p_roc_balanced_zoom,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models_zoomed.pdf",
+  plot = p_roc_balanced_zoom,
+  width = 8,
+  height = 6
+)
+
+############################################################
+## Plot predicted Tumor probability distribution
+## More informative when ROC curves are near-perfect
+############################################################
+
+library(data.table)
+library(ggplot2)
+
+## If predictions_balanced is already in memory, use it directly.
+## Otherwise, load from saved file.
+if (!exists("predictions_balanced")) {
+  predictions_balanced <- fread(
+    "TCGA_balanced_model_predictions.csv",
+    data.table = FALSE
+  )
+}
+
+predictions_balanced$Observed <- factor(
+  as.character(predictions_balanced$Observed),
+  levels = c("Normal", "Tumor")
+)
+
+predictions_balanced$Model <- factor(
+  predictions_balanced$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+
+p_prob_balanced <- ggplot(
+  predictions_balanced,
+  aes(x = Observed, y = Prob_Tumor, color = Observed, fill = Observed)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.55,
+    alpha = 0.25
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.45,
+    size = 1.4
+  ) +
+  facet_wrap(~ Model, nrow = 1) +
+  geom_hline(
+    yintercept = 0.5,
+    linetype = "dashed"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "Predicted Tumor probability in TCGA balanced cohort",
+    x = "Observed group",
+    y = "Predicted probability of Tumor",
+    color = "Observed group",
+    fill = "Observed group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    legend.position = "top"
+  )
+
+p_prob_balanced
+
+ggsave(
+  filename = "TCGA_balanced_predicted_Tumor_probability_distribution.png",
+  plot = p_prob_balanced,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_balanced_predicted_Tumor_probability_distribution.pdf",
+  plot = p_prob_balanced,
+  width = 10,
+  height = 5
+)
 ############################################################
 ## Module 16. Plot model performance barplot
 ## Fixed version using data.table::melt
