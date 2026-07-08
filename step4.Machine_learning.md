@@ -450,7 +450,7 @@ save(myLoad,file = "step0.3-TCGA-READ_output.Rdata")
 
 ```
 
-## Machine learning in GSE101764
+## Machine learning training in GSE101764
 We select 3 Models to do ML training:
 1. Elastic-net / LASSO logistic regression
 2. Random Forest
@@ -1222,700 +1222,1645 @@ print(model_performance)
 ```
 
 
-## ML testing in TCGA
+## external ML testing in TCGA
+
+### TCGA full/balanced cohort preprocessing
 ```{r}
 ############################################################
-## Module 9. Extract external test features from TCGA
+## Create TCGA-COAD + TCGA-READ balanced cohort
+## Input:
+##   step0.2-TCGA-COAD_output.Rdata
+##   step0.3-TCGA-READ_output.Rdata
+##
+## Output:
+##   step0.TCGA_COAD_READ_full_output.Rdata
+##   step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata
 ############################################################
 
-test_outputs <- lapply(seq_len(nrow(test_files)), function(i) {
-  
-  extract_dmr_features(
-    dataset_name = test_files$dataset[i],
-    rdata_file = test_files$file[i]
-  )
-  
-})
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
 
-test_feature_df <- rbindlist(
-  lapply(test_outputs, function(x) x$feature_df),
-  fill = TRUE
-)
+library(data.table)
 
-test_feature_df <- as.data.frame(test_feature_df)
-
-test_feature_info <- rbindlist(
-  lapply(test_outputs, function(x) x$feature_info),
-  fill = TRUE
-)
-
-test_feature_info <- as.data.frame(test_feature_info)
-
-dim(test_feature_df)
-table(test_feature_df$Group)
-table(test_feature_df$Dataset)
-
-write.csv(
-  test_feature_df,
-  file = file.path(output_dir, "TCGA_COAD_READ_239DMR_external_test_feature_matrix.csv"),
-  row.names = FALSE
-)
-
-write.csv(
-  test_feature_info,
-  file = file.path(output_dir, "TCGA_COAD_READ_239DMR_feature_CpG_info.csv"),
-  row.names = FALSE
-)
+set.seed(123)
 
 ############################################################
-## Module 10. Prepare ML matrices
+## Module 1. Set input files
 ############################################################
 
-meta_cols <- c(
-  "Sample_ID",
-  "Group",
-  "Dataset",
-  "Group_original"
-)
+coad_file <- "step0.2-TCGA-COAD_output.Rdata"
+read_file <- "step0.3-TCGA-READ_output.Rdata"
 
-feature_cols_train <- setdiff(colnames(train_feature_df), meta_cols)
-feature_cols_test <- setdiff(colnames(test_feature_df), meta_cols)
+target_tumor <- 60
+target_normal <- 40
 
-common_features <- intersect(
-  feature_cols_train,
-  feature_cols_test
-)
+if (!file.exists(coad_file)) {
+  stop(paste0("Cannot find file: ", coad_file))
+}
 
-cat("Common DMR features between training and test:", length(common_features), "\n")
-
-X_train_raw <- train_feature_df[, common_features, drop = FALSE]
-X_test_raw <- test_feature_df[, common_features, drop = FALSE]
-
-y_train <- factor(
-  train_feature_df$Group,
-  levels = c("Normal", "Tumor")
-)
-
-y_test <- factor(
-  test_feature_df$Group,
-  levels = c("Normal", "Tumor")
-)
-
-############################################################
-## Module 11. Remove features with high missingness
-############################################################
-
-feature_missing_rate_train <- colMeans(is.na(X_train_raw))
-feature_missing_rate_test <- colMeans(is.na(X_test_raw))
-
-keep_features <- names(feature_missing_rate_train)[
-  feature_missing_rate_train <= max_missing_rate &
-    feature_missing_rate_test <= max_missing_rate
-]
-
-X_train_raw <- X_train_raw[, keep_features, drop = FALSE]
-X_test_raw <- X_test_raw[, keep_features, drop = FALSE]
-
-cat("Features retained after missingness filtering:", ncol(X_train_raw), "\n")
-
-############################################################
-## Module 12. Remove zero-variance features
-############################################################
-
-feature_sd <- apply(
-  X_train_raw,
-  2,
-  sd,
-  na.rm = TRUE
-)
-
-keep_nonzero_features <- names(feature_sd)[
-  !is.na(feature_sd) &
-    feature_sd > 0
-]
-
-X_train_raw <- X_train_raw[, keep_nonzero_features, drop = FALSE]
-X_test_raw <- X_test_raw[, keep_nonzero_features, drop = FALSE]
-
-cat("Features retained after zero-variance filtering:", ncol(X_train_raw), "\n")
-
-############################################################
-## Module 13. Median imputation using training-set medians
-############################################################
-
-train_median <- apply(
-  X_train_raw,
-  2,
-  median,
-  na.rm = TRUE
-)
-
-for (j in seq_len(ncol(X_train_raw))) {
-  
-  X_train_raw[is.na(X_train_raw[, j]), j] <- train_median[j]
-  X_test_raw[is.na(X_test_raw[, j]), j] <- train_median[j]
+if (!file.exists(read_file)) {
+  stop(paste0("Cannot find file: ", read_file))
 }
 
 ############################################################
-## Module 14. Standardize features using training-set mean and SD
+## Module 2. Helper function to load myLoad object
 ############################################################
 
-train_mean <- apply(
-  X_train_raw,
-  2,
-  mean,
-  na.rm = TRUE
-)
-
-train_sd <- apply(
-  X_train_raw,
-  2,
-  sd,
-  na.rm = TRUE
-)
-
-train_sd[train_sd == 0 | is.na(train_sd)] <- 1
-
-X_train <- scale(
-  X_train_raw,
-  center = train_mean,
-  scale = train_sd
-)
-
-X_test <- scale(
-  X_test_raw,
-  center = train_mean,
-  scale = train_sd
-)
-
-X_train <- as.matrix(X_train)
-X_test <- as.matrix(X_test)
-
-############################################################
-## Module 15. Encode labels
-############################################################
-
-y_train_binary <- ifelse(y_train == "Tumor", 1, 0)
-y_test_binary <- ifelse(y_test == "Tumor", 1, 0)
-
-table(y_train)
-table(y_test)
-
-############################################################
-## Module 16. Train LASSO logistic regression model
-############################################################
-
-class_table <- table(y_train_binary)
-
-sample_weights <- ifelse(
-  y_train_binary == 1,
-  length(y_train_binary) / (2 * class_table["1"]),
-  length(y_train_binary) / (2 * class_table["0"])
-)
-
-sample_weights <- as.numeric(sample_weights)
-
-foldid <- make_stratified_foldid(
-  y = y_train_binary,
-  nfolds = 5
-)
-
-cv_fit <- cv.glmnet(
-  x = X_train,
-  y = y_train_binary,
-  family = "binomial",
-  alpha = 1,
-  type.measure = "auc",
-  nfolds = 5,
-  foldid = foldid,
-  weights = sample_weights
-)
-
-best_lambda <- cv_fit$lambda.1se
-
-final_model <- glmnet(
-  x = X_train,
-  y = y_train_binary,
-  family = "binomial",
-  alpha = 1,
-  lambda = best_lambda,
-  weights = sample_weights
-)
-
-############################################################
-## Module 17. If lambda.1se selects no DMRs, use lambda.min
-############################################################
-
-coef_mat_tmp <- coef(final_model)
-
-selected_tmp <- rownames(coef_mat_tmp)[
-  as.numeric(coef_mat_tmp[, 1]) != 0
-]
-
-selected_tmp <- setdiff(selected_tmp, "(Intercept)")
-
-if (length(selected_tmp) == 0) {
+load_tcga_myload <- function(file, project_name) {
   
-  cat("lambda.1se selected no DMR features. Switching to lambda.min.\n")
+  env <- new.env()
+  loaded_objects <- load(file, envir = env)
   
-  best_lambda <- cv_fit$lambda.min
-  
-  final_model <- glmnet(
-    x = X_train,
-    y = y_train_binary,
-    family = "binomial",
-    alpha = 1,
-    lambda = best_lambda,
-    weights = sample_weights
-  )
-}
-
-cat("Final lambda used:", best_lambda, "\n")
-
-############################################################
-## Module 18. Training-set prediction
-############################################################
-
-train_prob <- as.numeric(
-  predict(
-    final_model,
-    newx = X_train,
-    type = "response"
-  )
-)
-
-train_roc <- roc(
-  response = y_train_binary,
-  predictor = train_prob,
-  quiet = TRUE
-)
-
-train_auc <- as.numeric(auc(train_roc))
-
-cat("Training AUC:", train_auc, "\n")
-
-############################################################
-## Module 19. Select threshold using Youden index in training set
-############################################################
-
-train_coords <- coords(
-  train_roc,
-  x = "best",
-  best.method = "youden",
-  ret = c("threshold", "sensitivity", "specificity")
-)
-
-best_threshold <- as.numeric(train_coords["threshold"])
-
-cat("Best threshold from training set:", best_threshold, "\n")
-
-############################################################
-## Module 20. TCGA external test prediction
-############################################################
-
-test_prob <- as.numeric(
-  predict(
-    final_model,
-    newx = X_test,
-    type = "response"
-  )
-)
-
-test_pred <- ifelse(
-  test_prob >= best_threshold,
-  "Tumor",
-  "Normal"
-)
-
-test_pred <- factor(
-  test_pred,
-  levels = c("Normal", "Tumor")
-)
-
-test_roc <- roc(
-  response = y_test_binary,
-  predictor = test_prob,
-  quiet = TRUE
-)
-
-test_auc <- as.numeric(auc(test_roc))
-
-cat("External TCGA test AUC:", test_auc, "\n")
-
-############################################################
-## Module 21. Calculate performance metrics
-############################################################
-
-train_pred <- ifelse(
-  train_prob >= best_threshold,
-  "Tumor",
-  "Normal"
-)
-
-train_pred <- factor(
-  train_pred,
-  levels = c("Normal", "Tumor")
-)
-
-train_eval <- calculate_metrics(
-  true_label = y_train,
-  pred_label = train_pred,
-  prob = train_prob
-)
-
-test_eval <- calculate_metrics(
-  true_label = y_test,
-  pred_label = test_pred,
-  prob = test_prob
-)
-
-train_metrics <- train_eval$metrics
-train_metrics$Cohort <- train_dataset
-
-test_metrics <- test_eval$metrics
-test_metrics$Cohort <- "TCGA-COAD_READ"
-
-performance_summary <- rbind(
-  train_metrics,
-  test_metrics
-)
-
-cat("\nPerformance summary:\n")
-print(performance_summary)
-
-cat("\nExternal TCGA confusion matrix:\n")
-print(test_eval$confusion_matrix)
-
-############################################################
-## Module 22. TCGA project-specific performance
-############################################################
-
-test_prediction_df <- data.frame(
-  Sample_ID = test_feature_df$Sample_ID,
-  Group = test_feature_df$Group,
-  Dataset = test_feature_df$Dataset,
-  Group_original = test_feature_df$Group_original,
-  Predicted_prob_Tumor = test_prob,
-  Predicted_label = as.character(test_pred),
-  stringsAsFactors = FALSE
-)
-
-project_metrics_list <- list()
-
-for (proj in unique(test_prediction_df$Dataset)) {
-  
-  tmp <- test_prediction_df[
-    test_prediction_df$Dataset == proj,
-  ]
-  
-  if (length(unique(tmp$Group)) < 2) {
-    next
+  if (!"myLoad" %in% loaded_objects) {
+    stop(paste0(
+      "Object myLoad was not found in ",
+      file,
+      ". Objects found: ",
+      paste(loaded_objects, collapse = ", ")
+    ))
   }
   
-  tmp_eval <- calculate_metrics(
-    true_label = tmp$Group,
-    pred_label = factor(
-      tmp$Predicted_label,
-      levels = c("Normal", "Tumor")
-    ),
-    prob = tmp$Predicted_prob_Tumor
+  obj <- env$myLoad
+  
+  if (!"beta" %in% names(obj)) {
+    stop(paste0("myLoad$beta was not found in ", file))
+  }
+  
+  if (!"pd" %in% names(obj)) {
+    stop(paste0("myLoad$pd was not found in ", file))
+  }
+  
+  beta <- as.matrix(obj$beta)
+  storage.mode(beta) <- "numeric"
+  
+  pd <- as.data.frame(obj$pd)
+  
+  ## Make sure phenotype table has sample ID column
+  if (!"ID" %in% colnames(pd)) {
+    pd$ID <- rownames(pd)
+  }
+  
+  ## Align pd to beta matrix
+  if (!setequal(as.character(pd$ID), colnames(beta))) {
+    
+    if (setequal(rownames(pd), colnames(beta))) {
+      pd$ID <- rownames(pd)
+    } else {
+      stop(paste0("Sample IDs in beta and pd do not match in ", file))
+    }
+  }
+  
+  pd <- pd[match(colnames(beta), as.character(pd$ID)), , drop = FALSE]
+  rownames(pd) <- pd$ID
+  
+  stopifnot(identical(colnames(beta), rownames(pd)))
+  
+  ## Make sure group column exists
+  if (!"group" %in% colnames(pd)) {
+    
+    possible_group_col <- grep(
+      "group|sample_group|samplegroup|phenotype|status",
+      colnames(pd),
+      ignore.case = TRUE,
+      value = TRUE
+    )
+    
+    if (length(possible_group_col) >= 1) {
+      colnames(pd)[colnames(pd) == possible_group_col[1]] <- "group"
+    } else {
+      stop(paste0("Cannot find group column in ", file))
+    }
+  }
+  
+  ## Make sure project column exists
+  if (!"project" %in% colnames(pd)) {
+    pd$project <- project_name
+  }
+  
+  pd$project <- project_name
+  
+  ## Standardise group labels
+  pd$group <- as.character(pd$group)
+  pd$group <- ifelse(
+    grepl("tumor|tumour|cancer|carcinoma", pd$group, ignore.case = TRUE),
+    "Tumor",
+    ifelse(
+      grepl("normal|control|adjacent|solid tissue normal", pd$group, ignore.case = TRUE),
+      "Normal",
+      pd$group
+    )
   )
   
-  tmp_metrics <- tmp_eval$metrics
-  tmp_metrics$Cohort <- proj
+  pd$group <- factor(pd$group, levels = c("Normal", "Tumor"))
   
-  project_metrics_list[[proj]] <- tmp_metrics
+  cat("\nLoaded:", project_name, "\n")
+  cat("Beta dimension:\n")
+  print(dim(beta))
+  cat("pd dimension:\n")
+  print(dim(pd))
+  cat("Group distribution:\n")
+  print(table(pd$group, useNA = "ifany"))
+  
+  return(list(beta = beta, pd = pd))
 }
 
-project_metrics <- rbindlist(
-  project_metrics_list,
-  fill = TRUE
-)
-
-performance_summary <- rbindlist(
-  list(
-    as.data.table(performance_summary),
-    project_metrics
-  ),
-  fill = TRUE
-)
-
-performance_summary <- as.data.frame(performance_summary)
-
-print(performance_summary)
-
 ############################################################
-## Module 23. Extract selected DMR features
+## Module 3. Load COAD and READ
 ############################################################
 
-coef_mat <- coef(final_model)
-
-selected_features <- data.frame(
-  Feature = rownames(coef_mat),
-  Coefficient = as.numeric(coef_mat[, 1]),
-  stringsAsFactors = FALSE
+tcga_coad <- load_tcga_myload(
+  file = coad_file,
+  project_name = "TCGA-COAD"
 )
 
-selected_features <- selected_features[
-  selected_features$Coefficient != 0,
-]
-
-selected_features <- selected_features[
-  selected_features$Feature != "(Intercept)",
-]
-
-selected_features <- selected_features[
-  order(abs(selected_features$Coefficient), decreasing = TRUE),
-]
-
-cat("Number of selected DMR features by LASSO:", nrow(selected_features), "\n")
-
-selected_features <- merge(
-  selected_features,
-  dmrs,
-  by.x = "Feature",
-  by.y = "DMR_ID",
-  all.x = TRUE
+tcga_read <- load_tcga_myload(
+  file = read_file,
+  project_name = "TCGA-READ"
 )
-
-head(selected_features)
 
 ############################################################
-## Module 24. Save ML outputs
+## Module 4. Merge COAD and READ by common CpGs
 ############################################################
 
-write.csv(
-  performance_summary,
-  file = file.path(output_dir, "ML_239DMR_performance_summary.csv"),
-  row.names = FALSE
+common_cpgs <- intersect(
+  rownames(tcga_coad$beta),
+  rownames(tcga_read$beta)
 )
 
-write.csv(
-  test_prediction_df,
-  file = file.path(output_dir, "ML_239DMR_TCGA_external_test_predictions.csv"),
-  row.names = FALSE
+cat("\nNumber of common CpGs between COAD and READ:\n")
+print(length(common_cpgs))
+
+beta_full <- cbind(
+  tcga_coad$beta[common_cpgs, , drop = FALSE],
+  tcga_read$beta[common_cpgs, , drop = FALSE]
 )
 
-write.csv(
-  selected_features,
-  file = file.path(output_dir, "ML_239DMR_LASSO_selected_features.csv"),
-  row.names = FALSE
+pd_full <- rbind(
+  tcga_coad$pd,
+  tcga_read$pd
 )
 
-write.csv(
-  data.frame(
-    Feature = colnames(X_train),
-    stringsAsFactors = FALSE
-  ),
-  file = file.path(output_dir, "ML_239DMR_features_used_in_model.csv"),
-  row.names = FALSE
+## Check duplicated sample IDs
+if (anyDuplicated(colnames(beta_full)) > 0) {
+  duplicated_samples <- colnames(beta_full)[duplicated(colnames(beta_full))]
+  stop(paste0(
+    "Duplicated sample IDs found after merging: ",
+    paste(duplicated_samples, collapse = ", ")
+  ))
+}
+
+## Align pd with beta
+pd_full <- pd_full[match(colnames(beta_full), pd_full$ID), , drop = FALSE]
+rownames(pd_full) <- pd_full$ID
+
+stopifnot(identical(colnames(beta_full), rownames(pd_full)))
+
+############################################################
+## Module 5. Keep only Tumor and Normal samples
+############################################################
+
+keep_samples <- pd_full$group %in% c("Normal", "Tumor")
+
+pd_full <- pd_full[keep_samples, , drop = FALSE]
+beta_full <- beta_full[, rownames(pd_full), drop = FALSE]
+
+pd_full$group <- factor(
+  as.character(pd_full$group),
+  levels = c("Normal", "Tumor")
+)
+
+## Sort Normal first, Tumor second
+sample_order <- order(pd_full$group)
+
+pd_full <- pd_full[sample_order, , drop = FALSE]
+beta_full <- beta_full[, rownames(pd_full), drop = FALSE]
+
+stopifnot(identical(colnames(beta_full), rownames(pd_full)))
+
+cat("\nMerged full TCGA COAD + READ cohort:\n")
+print(table(pd_full$project, pd_full$group))
+print(table(pd_full$group))
+print(dim(beta_full))
+print(dim(pd_full))
+
+############################################################
+## Module 6. Save full merged TCGA cohort
+############################################################
+
+myLoad <- list(
+  beta = beta_full,
+  pd = pd_full
 )
 
 save(
-  dmrs,
-  train_feature_df,
-  test_feature_df,
-  train_feature_info,
-  test_feature_info,
-  X_train_raw,
-  X_test_raw,
-  X_train,
-  X_test,
-  y_train,
-  y_test,
-  y_train_binary,
-  y_test_binary,
-  cv_fit,
-  final_model,
-  best_lambda,
-  best_threshold,
-  train_prob,
-  test_prob,
-  train_eval,
-  test_eval,
-  performance_summary,
-  selected_features,
-  test_prediction_df,
-  train_mean,
-  train_sd,
-  train_median,
-  file = file.path(output_dir, "step1-ML-239DMR-GSE101764-train-TCGA-test-output.Rdata")
+  myLoad,
+  file = "step0.TCGA_COAD_READ_full_output.Rdata"
+)
+
+fwrite(
+  pd_full,
+  file = "TCGA_COAD_READ_full_sample_information.csv"
+)
+
+cat("\nSaved full TCGA cohort:\n")
+print("step0.TCGA_COAD_READ_full_output.Rdata")
+
+############################################################
+## Module 7. Create balanced cohort: 60 Tumor + 40 Normal
+############################################################
+
+tumor_ids <- rownames(pd_full)[pd_full$group == "Tumor"]
+normal_ids <- rownames(pd_full)[pd_full$group == "Normal"]
+
+cat("\nAvailable samples before balancing:\n")
+cat("Tumor:", length(tumor_ids), "\n")
+cat("Normal:", length(normal_ids), "\n")
+
+if (length(tumor_ids) < target_tumor) {
+  stop(paste0(
+    "Not enough Tumor samples. Available = ",
+    length(tumor_ids),
+    ", target = ",
+    target_tumor
+  ))
+}
+
+if (length(normal_ids) < target_normal) {
+  stop(paste0(
+    "Not enough Normal samples. Available = ",
+    length(normal_ids),
+    ", target = ",
+    target_normal
+  ))
+}
+
+selected_tumor_ids <- sample(
+  tumor_ids,
+  size = target_tumor,
+  replace = FALSE
+)
+
+selected_normal_ids <- sample(
+  normal_ids,
+  size = target_normal,
+  replace = FALSE
+)
+
+selected_ids <- c(selected_normal_ids, selected_tumor_ids)
+
+pd_balanced <- pd_full[selected_ids, , drop = FALSE]
+beta_balanced <- beta_full[, selected_ids, drop = FALSE]
+
+pd_balanced$group <- factor(
+  as.character(pd_balanced$group),
+  levels = c("Normal", "Tumor")
+)
+
+## Sort Normal first, Tumor second
+sample_order <- order(pd_balanced$group)
+
+pd_balanced <- pd_balanced[sample_order, , drop = FALSE]
+beta_balanced <- beta_balanced[, rownames(pd_balanced), drop = FALSE]
+
+stopifnot(identical(colnames(beta_balanced), rownames(pd_balanced)))
+
+cat("\nBalanced TCGA COAD + READ cohort:\n")
+print(table(pd_balanced$project, pd_balanced$group))
+print(table(pd_balanced$group))
+print(dim(beta_balanced))
+print(dim(pd_balanced))
+
+############################################################
+## Module 8. Save balanced TCGA cohort
+############################################################
+
+myLoad <- list(
+  beta = beta_balanced,
+  pd = pd_balanced
+)
+
+save(
+  myLoad,
+  file = "step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata"
+)
+
+fwrite(
+  pd_balanced,
+  file = "TCGA_COAD_READ_balanced_60Tumor_40Normal_sample_information.csv"
+)
+
+fwrite(
+  data.frame(
+    Sample = rownames(pd_balanced),
+    Project = pd_balanced$project,
+    Group = pd_balanced$group,
+    stringsAsFactors = FALSE
+  ),
+  file = "TCGA_COAD_READ_balanced_60Tumor_40Normal_selected_samples.csv"
+)
+
+cat("\nSaved balanced TCGA cohort:\n")
+print("step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata")
+
+```
+
+### TCGA full cohort external testing using 3 trained ML models
+Current-directory version:
+Input:
+1. GSE101764_ML_training_3models_110DMRs.Rdata
+2. step0.TCGA_COAD_READ_full_output.Rdata
+Models:
+1. Elastic-net logistic regression
+2. Random Forest
+3. Radial SVM
+```{r}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+set.seed(123)
+
+############################################################
+## Module 0. Load required packages
+############################################################
+
+library(data.table)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+############################################################
+## Module 1. Set input files in current directory
+############################################################
+
+training_model_file <- "GSE101764_ML_training_3models_110DMRs.Rdata"
+
+tcga_full_file <- "step0.TCGA_COAD_READ_full_output.Rdata"
+
+if (!file.exists(training_model_file)) {
+  stop(paste0("Training model file not found: ", training_model_file))
+}
+
+if (!file.exists(tcga_full_file)) {
+  stop(paste0("TCGA full cohort file not found: ", tcga_full_file))
+}
+
+############################################################
+## Module 2. Load trained models and training information
+############################################################
+
+load(training_model_file)
+
+required_objects <- c(
+  "model_glmnet",
+  "model_rf",
+  "model_svm",
+  "dmr.tbl",
+  "dmr.cpg.list",
+  "feature_name_map",
+  "ml_df"
+)
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(paste0(
+    "Missing objects in training Rdata: ",
+    paste(missing_objects, collapse = ", ")
+  ))
+}
+
+cat("\nTraining objects loaded successfully.\n")
+
+cat("\nBest glmnet tuning parameters:\n")
+print(model_glmnet$bestTune)
+
+############################################################
+## Module 3. Extract model-specific features
+############################################################
+
+get_model_features <- function(model, fallback_ml_df = ml_df) {
+  
+  if (!is.null(model$trainingData)) {
+    features <- setdiff(colnames(model$trainingData), ".outcome")
+  } else {
+    features <- setdiff(colnames(fallback_ml_df), "group")
+  }
+  
+  return(features)
+}
+
+features_glmnet <- get_model_features(model_glmnet)
+features_rf <- get_model_features(model_rf)
+features_svm <- get_model_features(model_svm)
+
+all_training_features <- unique(c(
+  features_glmnet,
+  features_rf,
+  features_svm
+))
+
+cat("\nNumber of model features:\n")
+cat("Elastic-net:", length(features_glmnet), "\n")
+cat("Random Forest:", length(features_rf), "\n")
+cat("Radial SVM:", length(features_svm), "\n")
+cat("All unique features:", length(all_training_features), "\n")
+
+############################################################
+## Module 4. Prepare training medians for missing-value imputation
+############################################################
+
+training_medians <- sapply(
+  ml_df[, all_training_features, drop = FALSE],
+  function(x) median(as.numeric(x), na.rm = TRUE)
+)
+
+training_medians[is.na(training_medians)] <- 0.5
+
+############################################################
+## Module 5. Load TCGA full myLoad object
+############################################################
+
+env <- new.env()
+loaded_objects <- load(tcga_full_file, envir = env)
+
+if (!"myLoad" %in% loaded_objects) {
+  stop(paste0(
+    "Object myLoad was not found in: ",
+    tcga_full_file,
+    ". Objects found: ",
+    paste(loaded_objects, collapse = ", ")
+  ))
+}
+
+myLoad_tcga <- env$myLoad
+
+if (!"beta" %in% names(myLoad_tcga)) {
+  stop("myLoad$beta was not found in TCGA full cohort file.")
+}
+
+if (!"pd" %in% names(myLoad_tcga)) {
+  stop("myLoad$pd was not found in TCGA full cohort file.")
+}
+
+beta_tcga <- as.matrix(myLoad_tcga$beta)
+storage.mode(beta_tcga) <- "numeric"
+
+pd_tcga <- as.data.frame(myLoad_tcga$pd)
+
+############################################################
+## Module 6. Align TCGA phenotype table with beta matrix
+############################################################
+
+if ("ID" %in% colnames(pd_tcga) && setequal(as.character(pd_tcga$ID), colnames(beta_tcga))) {
+  rownames(pd_tcga) <- as.character(pd_tcga$ID)
+}
+
+if (setequal(rownames(pd_tcga), colnames(beta_tcga))) {
+  pd_tcga <- pd_tcga[colnames(beta_tcga), , drop = FALSE]
+}
+
+if (!identical(rownames(pd_tcga), colnames(beta_tcga))) {
+  stop("Sample alignment failed between TCGA beta and pd.")
+}
+
+if (!"group" %in% colnames(pd_tcga)) {
+  stop("Column group was not found in TCGA pd.")
+}
+
+pd_tcga$group <- factor(
+  ifelse(as.character(pd_tcga$group) == "Tumor", "Tumor", "Normal"),
+  levels = c("Tumor", "Normal")
+)
+
+cat("\nTCGA full cohort sample distribution:\n")
+print(table(pd_tcga$group, useNA = "ifany"))
+
+if ("project" %in% colnames(pd_tcga)) {
+  print(table(pd_tcga$project, pd_tcga$group))
+}
+
+cat("\nTCGA beta dimension:\n")
+print(dim(beta_tcga))
+
+cat("\nTCGA pd dimension:\n")
+print(dim(pd_tcga))
+
+############################################################
+## Module 7. Build TCGA DMR-level beta matrix
+############################################################
+
+dmr_beta_mat <- matrix(
+  NA_real_,
+  nrow = ncol(beta_tcga),
+  ncol = nrow(dmr.tbl)
+)
+
+rownames(dmr_beta_mat) <- colnames(beta_tcga)
+colnames(dmr_beta_mat) <- dmr.tbl$DMR_id
+
+for (i in seq_len(nrow(dmr.tbl))) {
+  
+  cpgs_present <- intersect(dmr.cpg.list[[i]], rownames(beta_tcga))
+  
+  if (length(cpgs_present) > 0) {
+    dmr_beta_mat[, i] <- colMeans(
+      beta_tcga[cpgs_present, , drop = FALSE],
+      na.rm = TRUE
+    )
+  }
+}
+
+dmr_beta_mat[is.nan(dmr_beta_mat)] <- NA_real_
+
+############################################################
+## Module 8. Check CpG coverage in TCGA full cohort
+############################################################
+
+cpg_coverage <- data.frame(
+  DMR_id = dmr.tbl$DMR_id,
+  nCpG_present_TCGA_full = sapply(
+    dmr.cpg.list,
+    function(x) length(intersect(x, rownames(beta_tcga)))
+  ),
+  stringsAsFactors = FALSE
+)
+
+fwrite(
+  cpg_coverage,
+  file = "TCGA_full_DMR_CpG_coverage.csv"
+)
+
+cat("\nCpG coverage summary in TCGA full cohort:\n")
+print(summary(cpg_coverage$nCpG_present_TCGA_full))
+
+cat("\nNumber of DMRs with zero CpG coverage in TCGA:\n")
+print(sum(cpg_coverage$nCpG_present_TCGA_full == 0))
+
+############################################################
+## Module 9. Map DMR IDs to training feature names
+############################################################
+
+feature_names <- feature_name_map$Feature[
+  match(colnames(dmr_beta_mat), feature_name_map$DMR_id)
+]
+
+if (any(is.na(feature_names))) {
+  missing_dmr_ids <- colnames(dmr_beta_mat)[is.na(feature_names)]
+  stop(paste0(
+    "Some TCGA DMRs could not be mapped to training feature names: ",
+    paste(head(missing_dmr_ids, 20), collapse = ", ")
+  ))
+}
+
+colnames(dmr_beta_mat) <- feature_names
+
+missing_features <- setdiff(all_training_features, colnames(dmr_beta_mat))
+
+if (length(missing_features) > 0) {
+  stop(paste0(
+    "These training features are missing in TCGA matrix: ",
+    paste(missing_features, collapse = ", ")
+  ))
+}
+
+dmr_beta_mat <- dmr_beta_mat[, all_training_features, drop = FALSE]
+
+############################################################
+## Module 10. Impute missing values using training medians
+############################################################
+
+for (fn in all_training_features) {
+  
+  if (any(is.na(dmr_beta_mat[, fn]))) {
+    dmr_beta_mat[is.na(dmr_beta_mat[, fn]), fn] <- training_medians[fn]
+  }
+}
+
+if (any(is.na(dmr_beta_mat))) {
+  stop("There are still missing values after imputation.")
+}
+
+############################################################
+## Module 11. Build final TCGA full testing dataframe
+############################################################
+
+test_df_full <- data.frame(
+  group = pd_tcga$group,
+  dmr_beta_mat,
+  check.names = FALSE
+)
+
+rownames(test_df_full) <- rownames(pd_tcga)
+
+cat("\nTCGA full testing dataframe:\n")
+print(dim(test_df_full))
+print(table(test_df_full$group))
+
+fwrite(
+  data.frame(
+    Sample = rownames(test_df_full),
+    Group = test_df_full$group,
+    dmr_beta_mat,
+    check.names = FALSE
+  ),
+  file = "TCGA_full_DMR_level_beta_matrix_for_testing.csv"
 )
 
 ############################################################
-## Module 25. Visualization
+## Module 12. Helper function to evaluate one model
 ############################################################
 
-############################################################
-## Figure 1. ROC curves
-############################################################
-
-roc_train_df <- data.frame(
-  False_positive_rate = 1 - train_roc$specificities,
-  Sensitivity = train_roc$sensitivities,
-  Cohort = paste0(train_dataset, " training")
-)
-
-roc_test_df <- data.frame(
-  False_positive_rate = 1 - test_roc$specificities,
-  Sensitivity = test_roc$sensitivities,
-  Cohort = "TCGA external test"
-)
-
-roc_df <- rbind(
-  roc_train_df,
-  roc_test_df
-)
-
-p_roc <- ggplot(
-  roc_df,
-  aes(
-    x = False_positive_rate,
-    y = Sensitivity,
-    linetype = Cohort
+evaluate_one_model <- function(model, model_name, test_df, model_features) {
+  
+  x_test <- test_df[, model_features, drop = FALSE]
+  
+  prob <- predict(
+    model,
+    newdata = x_test,
+    type = "prob"
   )
+  
+  pred_class <- predict(
+    model,
+    newdata = x_test,
+    type = "raw"
+  )
+  
+  obs <- factor(
+    as.character(test_df$group),
+    levels = c("Tumor", "Normal")
+  )
+  
+  pred_class <- factor(
+    as.character(pred_class),
+    levels = c("Tumor", "Normal")
+  )
+  
+  roc_obj <- roc(
+    response = obs,
+    predictor = prob$Tumor,
+    levels = c("Normal", "Tumor"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  auc_value <- as.numeric(auc(roc_obj))
+  
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "Tumor"
+  )
+  
+  performance <- data.frame(
+    Model = model_name,
+    AUC = auc_value,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    stringsAsFactors = FALSE
+  )
+  
+  pred_df <- data.frame(
+    Sample = rownames(test_df),
+    Observed = obs,
+    Predicted = pred_class,
+    Prob_Tumor = prob$Tumor,
+    Prob_Normal = prob$Normal,
+    Model = model_name,
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(
+    performance = performance,
+    predictions = pred_df,
+    roc = roc_obj,
+    confusion_matrix = cm
+  ))
+}
+
+############################################################
+## Module 13. Test three models in TCGA full cohort
+############################################################
+
+res_glmnet_full <- evaluate_one_model(
+  model = model_glmnet,
+  model_name = "Elastic-net",
+  test_df = test_df_full,
+  model_features = features_glmnet
+)
+
+res_rf_full <- evaluate_one_model(
+  model = model_rf,
+  model_name = "Random Forest",
+  test_df = test_df_full,
+  model_features = features_rf
+)
+
+res_svm_full <- evaluate_one_model(
+  model = model_svm,
+  model_name = "Radial SVM",
+  test_df = test_df_full,
+  model_features = features_svm
+)
+
+############################################################
+## Module 14. Combine and save performance results
+############################################################
+
+performance_full <- rbind(
+  res_glmnet_full$performance,
+  res_rf_full$performance,
+  res_svm_full$performance
+)
+
+predictions_full <- rbind(
+  res_glmnet_full$predictions,
+  res_rf_full$predictions,
+  res_svm_full$predictions
+)
+
+cat("\nTCGA full model performance:\n")
+print(performance_full)
+
+fwrite(
+  performance_full,
+  file = "TCGA_full_model_performance.csv"
+)
+
+fwrite(
+  predictions_full,
+  file = "TCGA_full_model_predictions.csv"
+)
+
+capture.output(
+  res_glmnet_full$confusion_matrix,
+  file = "TCGA_full_confusion_matrix_elastic_net.txt"
+)
+
+capture.output(
+  res_rf_full$confusion_matrix,
+  file = "TCGA_full_confusion_matrix_random_forest.txt"
+)
+
+capture.output(
+  res_svm_full$confusion_matrix,
+  file = "TCGA_full_confusion_matrix_radial_svm.txt"
+)
+
+############################################################
+## Module 15. Plot ROC curves for three models
+############################################################
+
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.3f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+}
+
+roc_df_full <- rbind(
+  roc_to_df(
+    res_glmnet_full$roc,
+    "Elastic-net",
+    res_glmnet_full$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_full$roc,
+    "Random Forest",
+    res_rf_full$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_full$roc,
+    "Radial SVM",
+    res_svm_full$performance$AUC
+  )
+)
+
+p_roc_full <- ggplot(
+  roc_df_full,
+  aes(x = FPR, y = TPR, color = Model)
 ) +
-  geom_line(linewidth = 1) +
+  geom_line(linewidth = 1.2) +
   geom_abline(
     slope = 1,
     intercept = 0,
     linetype = "dashed"
   ) +
-  theme_bw(base_size = 13) +
+  coord_equal() +
   labs(
-    title = "ROC curves for 239-DMR LASSO model",
-    subtitle = paste0(
-      train_dataset,
-      " training AUC = ",
-      round(train_auc, 3),
-      "; TCGA test AUC = ",
-      round(test_auc, 3)
-    ),
-    x = "False positive rate",
-    y = "True positive rate",
-    linetype = NULL
+    title = "ROC curves in TCGA full cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = c(0.65, 0.20),
+    legend.background = element_rect(fill = "white", color = "black")
   )
 
-print(p_roc)
+p_roc_full
 
 ggsave(
-  filename = file.path(output_dir, "ML_239DMR_ROC_curve.png"),
-  plot = p_roc,
-  width = 6.5,
-  height = 5.5,
+  filename = "TCGA_full_ROC_curves_3models.png",
+  plot = p_roc_full,
+  width = 8,
+  height = 6,
   dpi = 300
 )
 
+ggsave(
+  filename = "TCGA_full_ROC_curves_3models.pdf",
+  plot = p_roc_full,
+  width = 8,
+  height = 6
+)
+
 ############################################################
-## Figure 2. Predicted tumor probability in TCGA
+## Module 16. Plot model performance heatmap
 ############################################################
 
-p_prob <- ggplot(
-  test_prediction_df,
-  aes(
-    x = Group,
-    y = Predicted_prob_Tumor
-  )
+library(data.table)
+library(ggplot2)
+
+performance_heat <- performance_full[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+performance_heat <- as.data.table(performance_heat)
+
+performance_heat <- data.table::melt(
+  performance_heat,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_heat$Metric <- factor(
+  performance_heat$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+performance_heat$Model <- factor(
+  performance_heat$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+
+p_heat_full <- ggplot(
+  performance_heat,
+  aes(x = Metric, y = Model, fill = Value)
 ) +
-  geom_boxplot(width = 0.45, outlier.shape = NA) +
-  geom_jitter(width = 0.12, alpha = 0.7, size = 1.8) +
-  geom_hline(
-    yintercept = best_threshold,
-    linetype = "dashed"
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    size = 5
   ) +
-  theme_bw(base_size = 13) +
+  scale_fill_gradient(
+    low = "#fdc771",
+    high = "#e14c48",
+    limits = c(0.95, 1.00)
+  ) +
   labs(
-    title = "Predicted tumor probability in TCGA external test cohort",
-    subtitle = paste0("Threshold selected from ", train_dataset),
+    title = "Model performance in TCGA full cohort",
     x = NULL,
-    y = "Predicted probability of Tumor"
+    y = NULL,
+    fill = "Performance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid = element_blank(),
+    legend.position = "right"
   )
 
-print(p_prob)
+p_heat_full
 
 ggsave(
-  filename = file.path(output_dir, "ML_239DMR_TCGA_predicted_probability_boxplot.png"),
-  plot = p_prob,
-  width = 5.5,
-  height = 5,
+  filename = "TCGA_full_model_performance_heatmap.png",
+  plot = p_heat_full,
+  width = 9,
+  height = 4.5,
   dpi = 300
 )
 
-############################################################
-## Figure 3. Predicted tumor probability by TCGA project
-############################################################
-
-p_prob_project <- ggplot(
-  test_prediction_df,
-  aes(
-    x = Dataset,
-    y = Predicted_prob_Tumor,
-    shape = Group
-  )
-) +
-  geom_boxplot(width = 0.45, outlier.shape = NA) +
-  geom_jitter(width = 0.12, alpha = 0.7, size = 1.8) +
-  geom_hline(
-    yintercept = best_threshold,
-    linetype = "dashed"
-  ) +
-  theme_bw(base_size = 13) +
-  labs(
-    title = "Predicted tumor probability by TCGA project",
-    x = NULL,
-    y = "Predicted probability of Tumor",
-    shape = NULL
-  )
-
-print(p_prob_project)
-
 ggsave(
-  filename = file.path(output_dir, "ML_239DMR_TCGA_predicted_probability_by_project.png"),
-  plot = p_prob_project,
-  width = 6.5,
-  height = 5,
-  dpi = 300
+  filename = "TCGA_full_model_performance_heatmap.pdf",
+  plot = p_heat_full,
+  width = 9,
+  height = 4.5
+)
+############################################################
+## Module 17. Save all full TCGA testing objects
+############################################################
+
+save(
+  test_df_full,
+  performance_full,
+  predictions_full,
+  roc_df_full,
+  p_roc_full,
+  res_glmnet_full,
+  res_rf_full,
+  res_svm_full,
+  file = "TCGA_full_testing_results_3models.Rdata"
 )
 
 ############################################################
-## Figure 4. Top selected DMR coefficients
+## Module 18. Final summary
 ############################################################
 
-top_coef <- head(selected_features, 20)
-
-if (nrow(top_coef) > 0) {
-  
-  top_coef$Feature <- factor(
-    top_coef$Feature,
-    levels = rev(top_coef$Feature)
-  )
-  
-  p_coef <- ggplot(
-    top_coef,
-    aes(
-      x = Feature,
-      y = Coefficient
-    )
-  ) +
-    geom_col(width = 0.7, fill = "grey70", color = "black") +
-    coord_flip() +
-    theme_bw(base_size = 13) +
-    labs(
-      title = "Top selected DMR features from LASSO model",
-      x = NULL,
-      y = "Model coefficient"
-    )
-  
-  print(p_coef)
-  
-  ggsave(
-    filename = file.path(output_dir, "ML_239DMR_top_LASSO_coefficients.png"),
-    plot = p_coef,
-    width = 7,
-    height = 6,
-    dpi = 300
-  )
-}
+cat("\nFinal TCGA full model performance:\n")
+print(performance_full)
 
 ```
 
+### TCGA balanced cohort external testing using 3 trained ML models
+Current-directory version:
+60 Tumor vs 40 Normal
+```{r}
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+set.seed(123)
+
+############################################################
+## Module 0. Load required packages
+############################################################
+
+library(data.table)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+############################################################
+## Module 1. Set input files in current directory
+############################################################
+
+training_model_file <- "GSE101764_ML_training_3models_110DMRs.Rdata"
+
+tcga_balanced_file <- "step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata"
+
+if (!file.exists(training_model_file)) {
+  stop(paste0("Training model file not found: ", training_model_file))
+}
+
+if (!file.exists(tcga_balanced_file)) {
+  stop(paste0("TCGA balanced file not found: ", tcga_balanced_file))
+}
+
+############################################################
+## Module 2. Load trained models and training information
+############################################################
+
+load(training_model_file)
+
+required_objects <- c(
+  "model_glmnet",
+  "model_rf",
+  "model_svm",
+  "dmr.tbl",
+  "dmr.cpg.list",
+  "feature_name_map",
+  "ml_df"
+)
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+if (length(missing_objects) > 0) {
+  stop(paste0(
+    "Missing objects in training Rdata: ",
+    paste(missing_objects, collapse = ", ")
+  ))
+}
+
+cat("\nTraining objects loaded successfully.\n")
+
+############################################################
+## Module 3. Extract model-specific features
+############################################################
+
+get_model_features <- function(model, fallback_ml_df = ml_df) {
+  
+  if (!is.null(model$trainingData)) {
+    features <- setdiff(colnames(model$trainingData), ".outcome")
+  } else {
+    features <- setdiff(colnames(fallback_ml_df), "group")
+  }
+  
+  return(features)
+}
+
+features_glmnet <- get_model_features(model_glmnet)
+features_rf <- get_model_features(model_rf)
+features_svm <- get_model_features(model_svm)
+
+all_training_features <- unique(c(
+  features_glmnet,
+  features_rf,
+  features_svm
+))
+
+cat("\nNumber of model features:\n")
+cat("Elastic-net:", length(features_glmnet), "\n")
+cat("Random Forest:", length(features_rf), "\n")
+cat("Radial SVM:", length(features_svm), "\n")
+cat("All unique features:", length(all_training_features), "\n")
+
+############################################################
+## Module 4. Prepare training medians for missing-value imputation
+############################################################
+
+training_medians <- sapply(
+  ml_df[, all_training_features, drop = FALSE],
+  function(x) median(as.numeric(x), na.rm = TRUE)
+)
+
+training_medians[is.na(training_medians)] <- 0.5
+
+############################################################
+## Module 5. Load TCGA balanced myLoad object
+############################################################
+
+env <- new.env()
+loaded_objects <- load(tcga_balanced_file, envir = env)
+
+if (!"myLoad" %in% loaded_objects) {
+  stop(paste0(
+    "Object myLoad was not found in: ",
+    tcga_balanced_file,
+    ". Objects found: ",
+    paste(loaded_objects, collapse = ", ")
+  ))
+}
+
+myLoad_tcga <- env$myLoad
+
+if (!"beta" %in% names(myLoad_tcga)) {
+  stop("myLoad$beta was not found in TCGA balanced file.")
+}
+
+if (!"pd" %in% names(myLoad_tcga)) {
+  stop("myLoad$pd was not found in TCGA balanced file.")
+}
+
+beta_tcga <- as.matrix(myLoad_tcga$beta)
+storage.mode(beta_tcga) <- "numeric"
+
+pd_tcga <- as.data.frame(myLoad_tcga$pd)
+
+############################################################
+## Module 6. Align TCGA phenotype table with beta matrix
+############################################################
+
+if ("ID" %in% colnames(pd_tcga) && setequal(as.character(pd_tcga$ID), colnames(beta_tcga))) {
+  rownames(pd_tcga) <- as.character(pd_tcga$ID)
+}
+
+if (setequal(rownames(pd_tcga), colnames(beta_tcga))) {
+  pd_tcga <- pd_tcga[colnames(beta_tcga), , drop = FALSE]
+}
+
+if (!identical(rownames(pd_tcga), colnames(beta_tcga))) {
+  stop("Sample alignment failed between TCGA beta and pd.")
+}
+
+if (!"group" %in% colnames(pd_tcga)) {
+  stop("Column group was not found in TCGA pd.")
+}
+
+pd_tcga$group <- factor(
+  ifelse(as.character(pd_tcga$group) == "Tumor", "Tumor", "Normal"),
+  levels = c("Tumor", "Normal")
+)
+
+cat("\nTCGA balanced cohort sample distribution:\n")
+print(table(pd_tcga$group, useNA = "ifany"))
+
+if ("project" %in% colnames(pd_tcga)) {
+  print(table(pd_tcga$project, pd_tcga$group))
+}
+
+cat("\nTCGA beta dimension:\n")
+print(dim(beta_tcga))
+
+cat("\nTCGA pd dimension:\n")
+print(dim(pd_tcga))
+
+############################################################
+## Module 7. Build TCGA DMR-level beta matrix
+############################################################
+
+dmr_beta_mat <- matrix(
+  NA_real_,
+  nrow = ncol(beta_tcga),
+  ncol = nrow(dmr.tbl)
+)
+
+rownames(dmr_beta_mat) <- colnames(beta_tcga)
+colnames(dmr_beta_mat) <- dmr.tbl$DMR_id
+
+for (i in seq_len(nrow(dmr.tbl))) {
+  
+  cpgs_present <- intersect(dmr.cpg.list[[i]], rownames(beta_tcga))
+  
+  if (length(cpgs_present) > 0) {
+    dmr_beta_mat[, i] <- colMeans(
+      beta_tcga[cpgs_present, , drop = FALSE],
+      na.rm = TRUE
+    )
+  }
+}
+
+dmr_beta_mat[is.nan(dmr_beta_mat)] <- NA_real_
+
+############################################################
+## Module 8. Check CpG coverage in TCGA balanced cohort
+############################################################
+
+cpg_coverage <- data.frame(
+  DMR_id = dmr.tbl$DMR_id,
+  nCpG_present_TCGA_balanced = sapply(
+    dmr.cpg.list,
+    function(x) length(intersect(x, rownames(beta_tcga)))
+  ),
+  stringsAsFactors = FALSE
+)
+
+fwrite(
+  cpg_coverage,
+  file = "TCGA_balanced_DMR_CpG_coverage.csv"
+)
+
+cat("\nCpG coverage summary in TCGA balanced cohort:\n")
+print(summary(cpg_coverage$nCpG_present_TCGA_balanced))
+
+############################################################
+## Module 9. Map DMR IDs to training feature names
+############################################################
+
+feature_names <- feature_name_map$Feature[
+  match(colnames(dmr_beta_mat), feature_name_map$DMR_id)
+]
+
+if (any(is.na(feature_names))) {
+  missing_dmr_ids <- colnames(dmr_beta_mat)[is.na(feature_names)]
+  stop(paste0(
+    "Some TCGA DMRs could not be mapped to training feature names: ",
+    paste(head(missing_dmr_ids, 20), collapse = ", ")
+  ))
+}
+
+colnames(dmr_beta_mat) <- feature_names
+
+missing_features <- setdiff(all_training_features, colnames(dmr_beta_mat))
+
+if (length(missing_features) > 0) {
+  stop(paste0(
+    "These training features are missing in TCGA matrix: ",
+    paste(missing_features, collapse = ", ")
+  ))
+}
+
+dmr_beta_mat <- dmr_beta_mat[, all_training_features, drop = FALSE]
+
+############################################################
+## Module 10. Impute missing values using training medians
+############################################################
+
+for (fn in all_training_features) {
+  
+  if (any(is.na(dmr_beta_mat[, fn]))) {
+    dmr_beta_mat[is.na(dmr_beta_mat[, fn]), fn] <- training_medians[fn]
+  }
+}
+
+if (any(is.na(dmr_beta_mat))) {
+  stop("There are still missing values after imputation.")
+}
+
+############################################################
+## Module 11. Build final TCGA balanced testing dataframe
+############################################################
+
+test_df_balanced <- data.frame(
+  group = pd_tcga$group,
+  dmr_beta_mat,
+  check.names = FALSE
+)
+
+rownames(test_df_balanced) <- rownames(pd_tcga)
+
+cat("\nTCGA balanced testing dataframe:\n")
+print(dim(test_df_balanced))
+print(table(test_df_balanced$group))
+
+fwrite(
+  data.frame(
+    Sample = rownames(test_df_balanced),
+    Group = test_df_balanced$group,
+    dmr_beta_mat,
+    check.names = FALSE
+  ),
+  file = "TCGA_balanced_DMR_level_beta_matrix_for_testing.csv"
+)
+
+############################################################
+## Module 12. Helper function to evaluate one model
+############################################################
+
+evaluate_one_model <- function(model, model_name, test_df, model_features) {
+  
+  x_test <- test_df[, model_features, drop = FALSE]
+  
+  prob <- predict(
+    model,
+    newdata = x_test,
+    type = "prob"
+  )
+  
+  pred_class <- predict(
+    model,
+    newdata = x_test,
+    type = "raw"
+  )
+  
+  obs <- factor(
+    as.character(test_df$group),
+    levels = c("Tumor", "Normal")
+  )
+  
+  pred_class <- factor(
+    as.character(pred_class),
+    levels = c("Tumor", "Normal")
+  )
+  
+  roc_obj <- roc(
+    response = obs,
+    predictor = prob$Tumor,
+    levels = c("Normal", "Tumor"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  auc_value <- as.numeric(auc(roc_obj))
+  
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "Tumor"
+  )
+  
+  performance <- data.frame(
+    Model = model_name,
+    AUC = auc_value,
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    Balanced_Accuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    stringsAsFactors = FALSE
+  )
+  
+  pred_df <- data.frame(
+    Sample = rownames(test_df),
+    Observed = obs,
+    Predicted = pred_class,
+    Prob_Tumor = prob$Tumor,
+    Prob_Normal = prob$Normal,
+    Model = model_name,
+    stringsAsFactors = FALSE
+  )
+  
+  return(list(
+    performance = performance,
+    predictions = pred_df,
+    roc = roc_obj,
+    confusion_matrix = cm
+  ))
+}
+
+############################################################
+## Module 13. Test three models in TCGA balanced cohort
+############################################################
+
+res_glmnet_balanced <- evaluate_one_model(
+  model = model_glmnet,
+  model_name = "Elastic-net",
+  test_df = test_df_balanced,
+  model_features = features_glmnet
+)
+
+res_rf_balanced <- evaluate_one_model(
+  model = model_rf,
+  model_name = "Random Forest",
+  test_df = test_df_balanced,
+  model_features = features_rf
+)
+
+res_svm_balanced <- evaluate_one_model(
+  model = model_svm,
+  model_name = "Radial SVM",
+  test_df = test_df_balanced,
+  model_features = features_svm
+)
+
+############################################################
+## Module 14. Combine and save performance results
+############################################################
+
+performance_balanced <- rbind(
+  res_glmnet_balanced$performance,
+  res_rf_balanced$performance,
+  res_svm_balanced$performance
+)
+
+predictions_balanced <- rbind(
+  res_glmnet_balanced$predictions,
+  res_rf_balanced$predictions,
+  res_svm_balanced$predictions
+)
+
+cat("\nTCGA balanced model performance:\n")
+print(performance_balanced)
+
+fwrite(
+  performance_balanced,
+  file = "TCGA_balanced_model_performance.csv"
+)
+
+fwrite(
+  predictions_balanced,
+  file = "TCGA_balanced_model_predictions.csv"
+)
+
+capture.output(
+  res_glmnet_balanced$confusion_matrix,
+  file = "TCGA_balanced_confusion_matrix_elastic_net.txt"
+)
+
+capture.output(
+  res_rf_balanced$confusion_matrix,
+  file = "TCGA_balanced_confusion_matrix_random_forest.txt"
+)
+
+capture.output(
+  res_svm_balanced$confusion_matrix,
+  file = "TCGA_balanced_confusion_matrix_radial_svm.txt"
+)
+
+############################################################
+## Module 15. Plot ROC curves for three models
+############################################################
+
+roc_to_df <- function(roc_obj, model_name, auc_value) {
+  
+  data.frame(
+    FPR = 1 - roc_obj$specificities,
+    TPR = roc_obj$sensitivities,
+    Model = paste0(model_name, " (AUC = ", sprintf("%.3f", auc_value), ")"),
+    stringsAsFactors = FALSE
+  )
+}
+
+roc_df_balanced <- rbind(
+  roc_to_df(
+    res_glmnet_balanced$roc,
+    "Elastic-net",
+    res_glmnet_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_rf_balanced$roc,
+    "Random Forest",
+    res_rf_balanced$performance$AUC
+  ),
+  roc_to_df(
+    res_svm_balanced$roc,
+    "Radial SVM",
+    res_svm_balanced$performance$AUC
+  )
+)
+
+p_roc_balanced <- ggplot(
+  roc_df_balanced,
+  aes(x = FPR, y = TPR, color = Model)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  coord_equal() +
+  labs(
+    title = "ROC curves in TCGA balanced cohort",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = c(0.65, 0.20),
+    legend.background = element_rect(fill = "white", color = "black")
+  )
+
+p_roc_balanced
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models.png",
+  plot = p_roc_balanced,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_balanced_ROC_curves_3models.pdf",
+  plot = p_roc_balanced,
+  width = 8,
+  height = 6
+)
+
+############################################################
+## Module 16. Plot model performance barplot
+## Fixed version using data.table::melt
+############################################################
+if(F){performance_long <- performance_balanced[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+## Convert data.frame to data.table before melt
+performance_long <- as.data.table(performance_long)
+
+performance_long <- data.table::melt(
+  performance_long,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_long$Metric <- factor(
+  performance_long$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+p_perf_balanced <- ggplot(
+  performance_long,
+  aes(x = Model, y = Value, fill = Metric)
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  coord_cartesian(ylim = c(0.95, 1.00), clip = "off") +
+  labs(
+    title = "Model performance in TCGA balanced cohort",
+    x = NULL,
+    y = "Performance",
+    fill = "Metric"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "top",
+    plot.margin = margin(10, 20, 10, 10)
+  )
+
+p_perf_balanced
+
+ggsave(
+  filename = "TCGA_balanced_model_performance_barplot.png",
+  plot = p_perf_balanced,
+  width = 10,
+  height = 6,
+  dpi = 300
+)}
+############################################################
+## Alternative: Heatmap-style performance plot
+## Recommended for very similar high-performance results
+############################################################
+
+library(data.table)
+library(ggplot2)
+
+performance_heat <- performance_balanced[, c(
+  "Model",
+  "AUC",
+  "Accuracy",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)]
+
+performance_heat <- as.data.table(performance_heat)
+
+performance_heat <- data.table::melt(
+  performance_heat,
+  id.vars = "Model",
+  variable.name = "Metric",
+  value.name = "Value"
+)
+
+performance_heat$Metric <- factor(
+  performance_heat$Metric,
+  levels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced_Accuracy"),
+  labels = c("AUC", "Accuracy", "Sensitivity", "Specificity", "Balanced accuracy")
+)
+
+performance_heat$Model <- factor(
+  performance_heat$Model,
+  levels = c("Elastic-net", "Random Forest", "Radial SVM")
+)
+
+p_heat_balanced <- ggplot(
+  performance_heat,
+  aes(x = Metric, y = Model, fill = Value)
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    size = 5
+  ) +
+  scale_fill_gradient(
+    low = "#fdd0c4",
+    high = "#ff2610",
+    limits = c(0.95, 1.00)
+  ) +
+  labs(
+    title = "Model performance in TCGA balanced cohort",
+    x = NULL,
+    y = NULL,
+    fill = "Performance"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y = element_text(size = 12),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+p_heat_balanced
+
+ggsave(
+  filename = "TCGA_balanced_model_performance_heatmap.png",
+  plot = p_heat_balanced,
+  width = 9,
+  height = 4.5,
+  dpi = 300
+)
+
+ggsave(
+  filename = "TCGA_balanced_model_performance_heatmap.pdf",
+  plot = p_heat_balanced,
+  width = 9,
+  height = 4.5
+)
+############################################################
+## Module 17. Save all balanced testing objects
+############################################################
+
+save(
+  test_df_balanced,
+  performance_balanced,
+  predictions_balanced,
+  roc_df_balanced,
+  p_roc_balanced,
+  p_perf_balanced,
+  res_glmnet_balanced,
+  res_rf_balanced,
+  res_svm_balanced,
+  file = "TCGA_balanced_testing_results_3models.Rdata"
+)
+cat("\nFinal TCGA balanced model performance:\n")
+print(performance_balanced)
+```
