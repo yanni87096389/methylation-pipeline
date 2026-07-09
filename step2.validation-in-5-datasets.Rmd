@@ -22,7 +22,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ## Module 0. Clear environment and load required packages
 ############################################################
 rm(list = ls())
-options(timeout = 100000) 
+options(timeout = 100000)
 options(scipen = 20)
 options(stringsAsFactors = F)
 require(GEOquery)
@@ -427,6 +427,11 @@ tail(check_df,10)
 table(pD$group)
 
 ## prepare standard beta value matrix
+if ( ! file.exists("GSE131013_normalized_matrix.txt.gz") ) {
+  download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE131013&format=file&file=GSE131013%5Fnormalized%5Fmatrix%2Etxt%2Egz",
+    destfile="GSE131013_normalized_matrix.txt.gz")
+}
+
 beta.df <- fread("GSE131013_normalized_matrix.txt.gz", data.table = FALSE)
 dim(beta.df)
 head(rownames(beta.df))
