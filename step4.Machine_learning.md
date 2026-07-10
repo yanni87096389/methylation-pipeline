@@ -1253,7 +1253,7 @@ coad_file <- "step0.2-TCGA-COAD_output.Rdata"
 read_file <- "step0.3-TCGA-READ_output.Rdata"
 
 target_tumor <- 60
-target_normal <- 40
+target_normal <- 45
 
 if (!file.exists(coad_file)) {
   stop(paste0("Cannot find file: ", coad_file))
@@ -1467,7 +1467,7 @@ cat("\nSaved full TCGA cohort:\n")
 print("step0.TCGA_COAD_READ_full_output.Rdata")
 
 ############################################################
-## Module 7. Create balanced cohort: 60 Tumor + 40 Normal
+## Module 7. Create balanced cohort: 60 Tumor + 45 Normal
 ############################################################
 
 tumor_ids <- rownames(pd_full)[pd_full$group == "Tumor"]
@@ -1542,12 +1542,12 @@ myLoad <- list(
 
 save(
   myLoad,
-  file = "step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata"
+  file = "step0.TCGA_COAD_READ_balanced_60Tumor_45Normal_output.Rdata"
 )
 
 fwrite(
   pd_balanced,
-  file = "TCGA_COAD_READ_balanced_60Tumor_40Normal_sample_information.csv"
+  file = "TCGA_COAD_READ_balanced_60Tumor_45Normal_sample_information.csv"
 )
 
 fwrite(
@@ -1557,11 +1557,11 @@ fwrite(
     Group = pd_balanced$group,
     stringsAsFactors = FALSE
   ),
-  file = "TCGA_COAD_READ_balanced_60Tumor_40Normal_selected_samples.csv"
+  file = "TCGA_COAD_READ_balanced_60Tumor_45Normal_selected_samples.csv"
 )
 
 cat("\nSaved balanced TCGA cohort:\n")
-print("step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata")
+print("step0.TCGA_COAD_READ_balanced_60Tumor_45Normal_output.Rdata")
 
 ```
 
@@ -2314,8 +2314,9 @@ print(performance_full)
 
 ### TCGA balanced cohort external testing using 3 trained ML models
 Current-directory version:
-60 Tumor vs 40 Normal
-```{r}
+60 Tumor vs 45 Normal
+
+```{r }
 rm(list = ls())
 options(stringsAsFactors = FALSE)
 options(scipen = 20)
@@ -2337,7 +2338,7 @@ library(ggplot2)
 
 training_model_file <- "GSE101764_ML_training_3models_110DMRs.Rdata"
 
-tcga_balanced_file <- "step0.TCGA_COAD_READ_balanced_60Tumor_40Normal_output.Rdata"
+tcga_balanced_file <- "step0.TCGA_COAD_READ_balanced_60Tumor_45Normal_output.Rdata"
 
 if (!file.exists(training_model_file)) {
   stop(paste0("Training model file not found: ", training_model_file))
@@ -2812,12 +2813,6 @@ ggsave(
   dpi = 300
 )
 
-ggsave(
-  filename = "TCGA_balanced_ROC_curves_3models.pdf",
-  plot = p_roc_balanced,
-  width = 8,
-  height = 6
-)
 ############################################################
 ## Plot ROC curves for TCGA balanced cohort
 ## Improved step-style ROC plot
@@ -3228,7 +3223,6 @@ save(
   predictions_balanced,
   roc_df_balanced,
   p_roc_balanced,
-  p_perf_balanced,
   res_glmnet_balanced,
   res_rf_balanced,
   res_svm_balanced,
@@ -3236,4 +3230,7 @@ save(
 )
 cat("\nFinal TCGA balanced model performance:\n")
 print(performance_balanced)
+
+
 ```
+
