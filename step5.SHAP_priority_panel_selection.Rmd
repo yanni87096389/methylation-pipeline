@@ -1,0 +1,2085 @@
+---
+title: "step5.SHAP_priority_panel_selection"
+author: "YC"
+date: "2026-07-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## TCGA full cohort
+
+```{r TCGA full cohort}
+############################################################
+## Step 5. SHAP-based prioritisation for wet-lab DMR panel
+##
+## Purpose:
+##   1. Use the best-performing radial SVM model
+##   2. Calculate SHAP values for all 110 DMRs
+##   3. Rank DMRs by SHAP importance
+##   4. Merge SHAP ranking with TCGA delta beta, validation evidence,
+##      other normal tissue background, and whole blood background
+##   5. Select a final top 10 DMR panel for wet-lab validation
+##   6. Generate:
+##        - SHAP importance barplot
+##        - SHAP summary beeswarm plot
+##        - top 10 DMR tumour-normal beta boxplot/beeswarm plot
+##
+## Important:
+##   SHAP should be calculated for all 110 DMRs first.
+##   The top 10 DMRs are selected AFTER ranking all 110 DMRs.
+############################################################
+
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+set.seed(123)
+
+############################################################
+## Module 0. Load required packages
+############################################################
+
+library(data.table)
+library(caret)
+library(fastshap)
+library(ggplot2)
+library(ggbeeswarm)
+library(pROC)
+library(kernlab)
+
+############################################################
+## Module 1. Set input files and output directory
+############################################################
+
+## Trained ML models from GSE101764.
+## Expected objects:
+##   model_svm, model_rf, model_glmnet, ml_df, feature_name_map
+training_model_file <- "GSE101764_ML_training_3models_110DMRs.Rdata"
+
+## TCGA full testing results.
+## Expected object:
+##   test_df_full
+tcga_testing_file <- "TCGA_full_testing_results_3models.Rdata"
+
+## Final 110 DMR table after other-normal-tissue and whole-blood filtering.
+final_dmr_file <- "final_DMRs_after_GSE196696_whole_blood_filter.csv"
+
+## Output directory
+outdir <- "step5.3_SHAP_priority_panel_selection"
+
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+############################################################
+## Module 2. Load trained models, TCGA test data and final DMR table
+############################################################
+
+load(training_model_file)
+
+required_training_objects <- c(
+  "model_svm",
+  "feature_name_map",
+  "ml_df"
+)
+
+load(tcga_testing_file)
+
+final_dmrs <- fread(final_dmr_file)
+
+dim(test_df_full)
+table(test_df_full$group)
+dim(final_dmrs)
+
+############################################################
+## Module 3. Select final model and extract model features
+############################################################
+
+## Based on your previous TCGA testing results, radial SVM performed best.
+final_model <- model_svm
+final_model_name <- "Radial SVM"
+print(final_model$bestTune)
+
+# Extract the predictor names used to train the final model
+# ".outcome" is the response variable stored by caret, so it is excluded
+features_svm <- setdiff(
+  colnames(final_model$trainingData),
+  ".outcome"
+)
+
+# Check the extracted feature names
+length(features_svm)
+head(features_svm,10)
+
+## Check all model features are present in TCGA test data
+stopifnot(all(features_svm %in% colnames(test_df_full)))
+length(setdiff(features_svm, colnames(test_df_full))) == 0
+
+############################################################
+## Module 4. Prepare TCGA data for SHAP
+############################################################
+
+## x_explain contains only DMR features.
+## This should be TCGA samples x 110 DMRs.
+x_explain <- test_df_full[, features_svm, drop = FALSE]
+x_explain <- as.data.frame(x_explain)
+head(rownames(x_explain))
+
+## Standardise group order for plotting.
+## SHAP will explain predicted probability of Tumor.
+test_df_full$group <- factor(
+  as.character(test_df_full$group),
+  levels = c("Normal", "Tumor")
+)
+check_dataframe <-data.frame(rownames(test_df_full),test_df_full$group)
+head(check_dataframe)
+tail(check_dataframe)
+############################################################
+## Module 5. Define prediction wrapper for SHAP
+############################################################
+
+## SHAP needs a prediction function.
+## Here we explain predicted probability of Tumor.
+##
+## Interpretation:
+##   SHAP value > 0 means this DMR pushes prediction towards Tumor.
+##   SHAP value < 0 means this DMR pushes prediction towards Normal.
+############################################################
+## Define prediction wrapper for SHAP
+############################################################
+
+pred_wrapper_svm <- function(object, newdata) {
+  
+  newdata <- as.data.frame(newdata)
+  newdata <- newdata[, features_svm, drop = FALSE]
+  
+  predict(
+    object,
+    newdata = newdata,
+    type = "prob"
+  )[, "Tumor"]
+}
+
+############################################################
+## Module 6. Run SHAP for ALL 110 DMRs
+############################################################
+
+## Important:
+##   Run SHAP on all 110 DMRs first.
+##   Then rank all 110 DMRs.
+##   Then select top 10.
+##
+## For quick testing, use nsim_shap <- 10.
+## For final results, use 50 or 100.
+nsim_shap <- 10
+
+set.seed(123)
+
+shap_svm <- fastshap::explain(
+  object = final_model,
+  X = x_explain,
+  pred_wrapper = pred_wrapper_svm,
+  nsim = nsim_shap,
+  adjust = TRUE
+)
+
+shap_svm <- as.data.frame(shap_svm)
+print(dim(shap_svm))
+
+## Expected dimension:
+##   number of TCGA samples x number of SVM DMR features
+save(
+  shap_svm,
+  file = file.path(outdir, "radial_SVM_SHAP_values_all_110_DMRs_TCGA_full.Rdata")
+)
+
+############################################################
+## Module 7. Summarise SHAP importance for each DMR
+############################################################
+
+## mean_abs_SHAP:
+##   average absolute contribution of each DMR across all TCGA samples.
+##   Higher mean_abs_SHAP = more important for model prediction.
+shap_importance <- data.table(
+  Feature = colnames(shap_svm),
+  mean_abs_SHAP = colMeans(abs(shap_svm), na.rm = TRUE),
+  mean_SHAP = colMeans(shap_svm, na.rm = TRUE)
+)
+
+setorder(shap_importance, -mean_abs_SHAP)
+shap_importance[, SHAP_rank := seq_len(.N)]
+head(shap_importance, 10)
+
+fwrite(
+  shap_importance,
+  file = file.path(outdir, "radial_SVM_SHAP_importance_all_110_DMRs.csv")
+)
+
+############################################################
+## Module 8. Merge SHAP ranking with the final DMR information
+############################################################
+
+final_priority_table <- merge(
+  shap_importance,
+  final_dmrs,
+  by.x = "Feature",
+  by.y = "DMR_ID",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# Restore SHAP ranking order
+setorder(final_priority_table, SHAP_rank)
+
+# Check the merged result
+dim(final_priority_table)
+head(final_priority_table)
+
+############################################################
+## Module 9. Calculate TCGA delta beta for each DMR feature
+############################################################
+
+## TCGA_deltaBeta:
+##   mean beta in Tumor - mean beta in Normal
+##
+## For your hypermethylated DMRs, this should usually be positive.
+calc_tcga_delta <- function(feature) {
+  
+  values <- as.numeric(test_df_full[[feature]])
+  group <- test_df_full$group
+  
+  normal_values <- values[group == "Normal"]
+  tumor_values <- values[group == "Tumor"]
+  
+  mean_normal <- mean(normal_values, na.rm = TRUE)
+  mean_tumor <- mean(tumor_values, na.rm = TRUE)
+  delta_beta <- mean_tumor - mean_normal
+  
+  p_value <- tryCatch(
+    wilcox.test(tumor_values, normal_values)$p.value,
+    error = function(e) NA_real_
+  )
+  
+  data.table(
+    Feature = feature,
+    TCGA_mean_Normal = mean_normal,
+    TCGA_mean_Tumor = mean_tumor,
+    TCGA_deltaBeta = delta_beta,
+    TCGA_wilcox_p = p_value
+  )
+}
+
+tcga_delta_table <- rbindlist(
+  lapply(features_svm, calc_tcga_delta),
+  fill = TRUE
+)
+
+tcga_delta_table[, TCGA_FDR := p.adjust(TCGA_wilcox_p, method = "BH")]
+
+fwrite(
+  tcga_delta_table,
+  file = file.path(outdir, "TCGA_full_deltaBeta_all_110_DMRs.csv")
+)
+head(tcga_delta_table)
+
+############################################################
+## Module 10. Merge SHAP + TCGA delta + final DMR evidence
+############################################################
+## final_priority_table was created in Module 8:
+##   shap_importance$Feature matched with final_dmrs$DMR_ID
+##
+## tcga_delta_table was created in Module 9:
+##   one row per Feature with TCGA delta beta and Wilcoxon results
+##  Merge TCGA delta-beta results into the Module 8 table
+
+priority_table <- merge(
+  final_priority_table,
+  tcga_delta_table,
+  by = "Feature",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+## Move the key ranking and validation columns to the front
+key_cols <- intersect(
+  c(
+    "SHAP_rank",
+    "Feature",
+    "mean_abs_SHAP",
+    "TCGA_mean_Normal",
+    "TCGA_mean_Tumor",
+    "TCGA_deltaBeta",
+    "TCGA_wilcox_p",
+    "TCGA_FDR",
+    "DMR_coordinate",
+    "chr",
+    "start",
+    "end",
+    "DMR_length"
+  ),
+  colnames(priority_table)
+)
+
+setcolorder(
+  priority_table,
+  c(key_cols, setdiff(colnames(priority_table), key_cols))
+)
+dim(priority_table)
+head(priority_table)
+
+##Save the final priority table
+fwrite(priority_table,file = file.path(outdir,
+"SHAP_TCGA_validation_background_all_110_DMRs.csv"))
+
+############################################################
+## Module 11. Build SHAP-discovery delta priority score
+############################################################
+## The final priority score uses:
+##   60% SHAP importance
+##   40% mean delta beta across the three discovery datasets
+## The priority score is only used to rank DMR candidates.
+## It is not a p-value or statistical significance measure.
+priority_table_scored <- copy(priority_table)
+############################################################
+## Define a function to scale values between 0 and 1
+############################################################
+
+scale01 <- function(x) {
+  x <- as.numeric(x)
+  if (all(is.na(x))) {
+    return(rep(0, length(x)))
+  }
+  rng <- range(x, na.rm = TRUE)
+  if (!all(is.finite(rng)) || rng[1] == rng[2]) {
+    
+    out <- rep(0.5, length(x))
+    
+  } else {
+    out <- (x - rng[1]) / (rng[2] - rng[1])
+  }
+  out[is.na(out)] <- 0
+  
+  return(out)
+}
+
+##Convert SHAP importance to a 0-1 score.
+priority_table_scored[, score_SHAP :=
+                        scale01(mean_abs_SHAP)]
+
+## Convert discovery delta beta to a 0-1 score
+priority_table_scored[, score_discovery_delta :=
+                        scale01(discovery_deltaBeta)]
+## Calculate the combined priority score
+## Combine the two scaled scores
+priority_table_scored[, priority_score :=
+                        0.60 * score_SHAP +
+                        0.40 * score_discovery_delta]
+
+## Rank DMR candidates
+## Sort the table from highest to lowest priority score.
+##
+## If two DMRs have the same priority score:
+##   1. the DMR with higher mean_abs_SHAP is ranked first;
+##   2. if still tied, the DMR with higher discovery_deltaBeta
+##      is ranked first.
+
+setorder(
+  priority_table_scored,
+  -priority_score,
+  -mean_abs_SHAP,
+  -discovery_deltaBeta
+)
+## Assign the final priority rank
+## priority_rank = 1 represents the highest-priority DMR.
+priority_table_scored[, priority_rank := seq_len(.N)]
+
+## rank comparison
+ranking_comparison <- priority_table_scored[
+  ,
+  .(
+    Feature,
+    SHAP_rank,
+    priority_rank,
+    mean_abs_SHAP,
+    discovery_deltaBeta,
+    score_SHAP,
+    score_discovery_delta,
+    priority_score
+  )
+]
+## A positive value means that the DMR ranks better in the
+## combined ranking than in the SHAP-only ranking.
+ranking_comparison[, rank_change :=
+                     SHAP_rank - priority_rank]
+setorder(ranking_comparison, priority_rank)
+head(ranking_comparison, 20)
+
+## Original table from Module 10
+fwrite(
+  priority_table,
+  file = file.path(outdir,
+    "SHAP_TCGA_validation_background_all_110_DMRs.csv"))
+
+## New table ranked by the combined score
+fwrite(priority_table_scored,
+  file = file.path(outdir,
+    "SHAP_discovery_delta_scored_all_110_DMRs.csv"))
+
+## Direct comparison between SHAP rank and combined rank
+fwrite(ranking_comparison,
+  file = file.path(outdir,
+    "SHAP_vs_combined_priority_ranking_comparison.csv"))
+
+## Select final top 10 DMRs for wet-lab validation
+top10_dmrs <- priority_table_scored[
+  priority_rank <= 10]
+fwrite(top10_dmrs,
+       file = file.path(outdir,
+      "Final_top10_DMRs_for_wetlab_validation.csv"))
+
+############################################################
+## Module 12. Visualization
+############################################################
+
+library(data.table)
+library(ggplot2)
+library(ggbeeswarm)
+top10_dmrs <- copy(priority_table_scored[
+    priority_rank <= 10])
+
+## Arrange the selected DMRs from rank 1 to rank 10.
+setorder(top10_dmrs, priority_rank)
+ 
+## Create a consistent label for all plots
+top10_dmrs[, DMR_label :=paste0("Rank ",priority_rank,": ",Feature)]
+
+## Reverse the factor levels so that rank 1 appears at the
+## top of horizontal bar plots and SHAP summary plots.
+
+top10_dmrs[, DMR_label :=factor(DMR_label,levels = rev(DMR_label))]
+
+############################################################
+## Plot1: Combined priority score barplot
+############################################################
+## The DMRs are ranked using the combined priority score: 
+#priority_score =0.60 * scaled SHAP importance +0.40 * scaled discovery delta beta
+
+p_priority_bar <- ggplot(
+  top10_dmrs,
+  aes(x = priority_score,
+    y = DMR_label)) +
+  geom_col(
+    width = 0.7,
+    fill = "grey40"
+  ) +
+  geom_text(
+    aes(
+      label = sprintf("%.3f", priority_score)
+    ),
+    hjust = -0.12,
+    size = 3.5
+  ) +
+  expand_limits(
+    x = max(
+      top10_dmrs$priority_score,
+      na.rm = TRUE
+    ) * 1.15
+  ) +
+  labs(
+    title = "Final top 10 DMRs by combined priority score",
+    subtitle = "60% SHAP importance + 40% discovery delta beta",
+    x = "Combined priority score",
+    y = "DMR"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank()
+  )
+
+print(p_priority_bar)
+ggsave(filename = file.path(outdir,
+      "final_top10_combined_priority_score_barplot.png"),
+  plot = p_priority_bar,
+  width = 10,
+  height = 7,
+  dpi = 300)
+
+ggsave(
+  filename = file.path(outdir,
+ "final_top10_combined_priority_score_barplot.pdf"),
+  plot = p_priority_bar,
+  width = 10,
+  height = 7)
+
+############################################################
+## Plot2. Visualise the two weighted score components
+############################################################
+## Calculate the actual contribution of each component to the
+## final priority score.
+## weighted_SHAP:
+##   contribution from scaled SHAP importance
+## weighted_discovery_delta:
+##   contribution from scaled discovery delta beta
+## Their sum should equal priority_score.
+
+top10_dmrs[, weighted_SHAP :=0.60 * score_SHAP]
+
+top10_dmrs[, weighted_discovery_delta :=0.40 * score_discovery_delta]
+
+############################################################
+## Confirm that the two contributions reproduce the score
+############################################################
+top10_dmrs[, score_check :=weighted_SHAP +weighted_discovery_delta]
+
+cat(
+  "\nMaximum difference between priority_score and score_check:\n"
+)
+
+print(
+  max(
+    abs(
+      top10_dmrs$priority_score -
+        top10_dmrs$score_check
+    ),
+    na.rm = TRUE
+  )
+)
+
+
+############################################################
+## Convert the component scores to long format
+############################################################
+
+component_plot_df <- melt(
+  top10_dmrs,
+  id.vars = c(
+    "Feature",
+    "priority_rank",
+    "DMR_label",
+    "priority_score"
+  ),
+  measure.vars = c(
+    "weighted_SHAP",
+    "weighted_discovery_delta"
+  ),
+  variable.name = "Score_component",
+  value.name = "Weighted_contribution"
+)
+
+component_plot_df[
+  ,
+  Score_component := factor(
+    Score_component,
+    levels = c(
+      "weighted_SHAP",
+      "weighted_discovery_delta"
+    ),
+    labels = c(
+      "SHAP contribution (60%)",
+      "Discovery delta contribution (40%)"))]
+
+## Create a stacked barplot of weighted contributions
+############################################################
+## The total length of each stacked bar is the final
+## priority_score.
+## This plot shows whether a DMR ranked highly mainly because
+## of its SHAP importance, its discovery delta beta, or both.
+
+p_component_bar <- ggplot(
+  component_plot_df,
+  aes(
+    x = Weighted_contribution,
+    y = DMR_label,
+    fill = Score_component
+  )
+) +
+  geom_col(
+    width = 0.7
+  ) +
+  geom_text(
+    data = top10_dmrs,
+    aes(
+      x = priority_score,
+      y = DMR_label,
+      label = sprintf("%.3f", priority_score)
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.12,
+    size = 3.4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "SHAP contribution (60%)" = "#4C78A8",
+      "Discovery delta contribution (40%)" = "#F58518"
+    )
+  ) +
+  expand_limits(
+    x = max(
+      top10_dmrs$priority_score,
+      na.rm = TRUE
+    ) * 1.15
+  ) +
+  labs(
+    title = "Contribution to the final priority score",
+    subtitle = "Weighted SHAP and discovery delta-beta components",
+    x = "Weighted contribution",
+    y = "DMR",
+    fill = "Score component"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank(),
+    legend.position = "top")
+
+print(p_component_bar)
+ggsave(
+  filename = file.path(outdir,"final_top10_priority_score_components.png"),
+  plot = p_component_bar,
+  width = 10,
+  height = 7,
+  dpi = 300)
+
+ggsave(
+  filename = file.path(outdir,"final_top10_priority_score_components.pdf"),
+  plot = p_component_bar,
+  width = 10,
+  height = 7)
+
+############################################################
+## Plot3. SHAP summary beeswarm for the final top 10 DMRs
+############################################################
+## Identify top 10 features available in the SHAP matrix
+selected_features_shap <- as.character( top10_dmrs$Feature)
+selected_features_shap <- selected_features_shap[
+  selected_features_shap %in% colnames(shap_svm)]
+
+############################################################
+## Create the feature-to-label mapping
+############################################################
+
+selected_label_map_shap <- top10_dmrs[Feature %in% selected_features_shap,
+  .(Feature,
+    priority_rank,
+    DMR_label)]
+
+selected_label_map_shap[
+  ,
+  DMR_label := as.character(DMR_label)]
+############################################################
+## Create sample identifiers
+############################################################
+
+sample_ids_shap <- rownames(x_explain)
+
+if (is.null(sample_ids_shap)) {
+  sample_ids_shap <- paste0(
+    "Sample_",
+    seq_len(nrow(x_explain))
+  )
+}
+
+
+############################################################
+## Convert the SHAP matrix to long format
+############################################################
+
+shap_dt <- as.data.table(
+  shap_svm[
+    ,
+    selected_features_shap,
+    drop = FALSE
+  ]
+)
+
+shap_dt[, Sample := sample_ids_shap]
+
+shap_long <- melt(
+  shap_dt,
+  id.vars = "Sample",
+  measure.vars = selected_features_shap,
+  variable.name = "Feature",
+  value.name = "SHAP_value"
+)
+
+
+############################################################
+## Convert the corresponding DMR beta matrix to long format
+############################################################
+
+beta_dt <- as.data.table(
+  as.data.frame(x_explain)[
+    ,
+    selected_features_shap,
+    drop = FALSE
+  ]
+)
+
+beta_dt[, Sample := sample_ids_shap]
+
+beta_long <- melt(
+  beta_dt,
+  id.vars = "Sample",
+  measure.vars = selected_features_shap,
+  variable.name = "Feature",
+  value.name = "DMR_beta"
+)
+
+
+############################################################
+## Merge SHAP values with the corresponding beta values
+############################################################
+
+shap_plot_df <- merge(
+  shap_long,
+  beta_long,
+  by = c(
+    "Sample",
+    "Feature"
+  ),
+  all.x = TRUE
+)
+
+
+############################################################
+## Add the combined priority rank labels
+############################################################
+
+shap_plot_df <- merge(
+  shap_plot_df,
+  selected_label_map_shap[
+    ,
+    .(
+      Feature,
+      priority_rank,
+      DMR_label
+    )
+  ],
+  by = "Feature",
+  all.x = TRUE
+)
+
+
+############################################################
+## Arrange rank 1 at the top of the plot
+############################################################
+
+label_order_shap <- selected_label_map_shap[
+  order(priority_rank),
+  DMR_label
+]
+
+shap_plot_df[
+  ,
+  DMR_label := factor(
+    DMR_label,
+    levels = rev(label_order_shap)
+  )
+]
+
+
+############################################################
+## Create the SHAP summary beeswarm plot
+############################################################
+
+p_shap_beeswarm <- ggplot(
+  shap_plot_df,
+  aes(
+    x = SHAP_value,
+    y = DMR_label,
+    color = DMR_beta
+  )
+) +
+  ggbeeswarm::geom_quasirandom(
+    groupOnX = FALSE,
+    alpha = 0.75,
+    size = 1.2,
+    width = 0.25
+  ) +
+  scale_color_gradient(
+    low = "#2C7BB6",
+    high = "#D7191C"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  labs(
+    title = "SHAP summary plot for the final top 10 DMRs",
+    subtitle = "Top 10 selected using SHAP importance and discovery delta beta",
+    x = "SHAP value for predicted Tumor probability",
+    y = "DMR",
+    color = "DMR beta"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9)
+  )
+
+print(p_shap_beeswarm)
+ggsave(filename = file.path(outdir,"final_top10_SHAP_summary_beeswarm.png"),
+  plot = p_shap_beeswarm,
+  width = 10,
+  height = 7,
+  dpi = 300)
+
+ggsave(filename = file.path(outdir,"final_top10_SHAP_summary_beeswarm.pdf"),
+  plot = p_shap_beeswarm,
+  width = 10,
+  height = 7)
+
+############################################################
+## Plot4. TCGA beta boxplot and beeswarm for final top 10
+############################################################
+
+## This plot directly checks whether each selected DMR
+## separates Normal and Tumor samples in the TCGA cohort.
+## Although discovery_deltaBeta was calculated using the
+## three discovery datasets, this figure provides visual
+## confirmation in the TCGA external cohort.
+############################################################
+## Identify selected features available in test_df_full
+############################################################
+
+selected_features_beta <- as.character(
+  top10_dmrs$Feature)
+
+selected_features_beta <- selected_features_beta[
+  selected_features_beta %in% colnames(test_df_full)]
+
+missing_beta_features <- setdiff(
+  as.character(top10_dmrs$Feature),
+  selected_features_beta)
+
+############################################################
+## Create feature-to-label mapping
+############################################################
+
+selected_label_map_beta <- top10_dmrs[
+  Feature %in% selected_features_beta,
+  .(
+    Feature,
+    priority_rank,
+    DMR_label
+  )
+]
+
+selected_label_map_beta[
+  ,
+  DMR_label := as.character(DMR_label)
+]
+
+
+############################################################
+## Prepare the TCGA beta data
+############################################################
+
+test_df_plot <- as.data.frame(test_df_full)
+
+sample_ids_beta <- rownames(test_df_plot)
+
+if (is.null(sample_ids_beta)) {
+  sample_ids_beta <- paste0(
+    "Sample_",
+    seq_len(nrow(test_df_plot))
+  )
+}
+
+beta_selected_dt <- as.data.table(
+  test_df_plot[
+    ,
+    c(
+      "group",
+      selected_features_beta
+    ),
+    drop = FALSE
+  ]
+)
+
+beta_selected_dt[, Sample := sample_ids_beta]
+
+## Convert TCGA beta data to long format
+beta_selected_long <- melt(
+  beta_selected_dt,
+  id.vars = c(
+    "Sample",
+    "group"
+  ),
+  measure.vars = selected_features_beta,
+  variable.name = "Feature",
+  value.name = "DMR_beta"
+)
+## Add priority-rank labels
+beta_selected_long <- merge(
+  beta_selected_long,
+ selected_label_map_beta[,.(
+      Feature,
+      priority_rank,
+      DMR_label)],
+  by = "Feature",
+  all.x = TRUE)
+
+## Set the group order
+beta_selected_long[,group := factor(as.character(group),levels = c("Normal","Tumor"))]
+## Arrange facets from priority rank 1 to rank 10
+label_order_beta <- selected_label_map_beta[
+  order(priority_rank),
+  DMR_label]
+
+beta_selected_long[,DMR_label := factor(DMR_label,levels = label_order_beta)]
+
+## Create the TCGA beta boxplot and beeswarm
+p_beta_box_beeswarm <- ggplot(
+  beta_selected_long,
+  aes(
+    x = group,
+    y = DMR_beta,
+    color = group,
+    fill = group
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.25,
+    width = 0.55
+  ) +
+  ggbeeswarm::geom_quasirandom(
+    width = 0.18,
+    alpha = 0.55,
+    size = 1.1
+  ) +
+  facet_wrap(
+    ~ DMR_label,
+    ncol = 2,
+    scales = "free_y"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "TCGA confirmation of the final top 10 DMRs",
+    subtitle = "Final candidates selected using SHAP and discovery delta beta",
+    x = NULL,
+    y = "DMR mean beta value",
+    color = "Group",
+    fill = "Group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    legend.position = "top"
+  )
+
+print(p_beta_box_beeswarm)
+## Save the TCGA beta boxplot and beeswarm
+ggsave(filename = file.path(outdir,"final_top10_TCGA_beta_boxplot_beeswarm.png"),
+  plot = p_beta_box_beeswarm,
+  width = 11,
+  height = 12,
+  dpi = 300
+)
+
+ggsave(filename = file.path(outdir,"final_top10_TCGA_beta_boxplot_beeswarm.pdf"),
+  plot = p_beta_box_beeswarm,
+  width = 11,
+  height = 12)
+
+save(priority_table_scored,
+  top10_dmrs,
+  component_plot_df,
+  shap_plot_df,
+  beta_selected_long,
+  p_priority_bar,
+  p_component_bar,
+  p_shap_beeswarm,
+  p_beta_box_beeswarm,
+  file = file.path(outdir,"final_top10_DMR_visualisation_results_full.Rdata"))
+
+```
+
+## TCGA balanced cohort
+```{r}
+############################################################
+## Step 5.2 SHAP-based prioritisation for wet-lab DMR panel
+## TCGA balanced cohort
+##
+## Purpose:
+##   1. Use the best-performing radial SVM model
+##   2. Calculate SHAP values for all 110 DMRs in TCGA balanced cohort
+##   3. Rank DMRs by SHAP importance
+##   4. Merge SHAP ranking with TCGA balanced delta beta and final DMR information
+##   5. Build a combined priority score:
+##        60% SHAP importance
+##        40% discovery delta beta
+##   6. Select final top 10 DMRs for wet-lab validation
+##   7. Generate:
+##        - combined priority score barplot
+##        - weighted score component barplot
+##        - SHAP summary beeswarm plot
+##        - TCGA balanced beta boxplot / beeswarm plot
+############################################################
+
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+set.seed(123)
+
+############################################################
+## Module 0. Load required packages
+############################################################
+
+library(data.table)
+library(caret)
+library(fastshap)
+library(ggplot2)
+library(ggbeeswarm)
+library(pROC)
+library(kernlab)
+
+############################################################
+## Module 1. Set input files and output directory
+############################################################
+
+## Trained ML models from GSE101764
+training_model_file <- "GSE101764_ML_training_3models_110DMRs.Rdata"
+
+## TCGA balanced testing results
+## Expected object:
+##   test_df_balanced
+tcga_testing_file <- "TCGA_balanced_testing_results_3models.Rdata"
+
+## Final 110 DMR table after other-normal-tissue and whole-blood filtering
+final_dmr_file <- "final_DMRs_after_GSE196696_whole_blood_filter.csv"
+
+## Output directory
+outdir <- "step5.2_SHAP_priority_panel_selection_TCGA_balanced"
+
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+############################################################
+## Module 2. Load trained models, TCGA balanced data and final DMR table
+############################################################
+
+load(training_model_file)
+
+load(tcga_testing_file)
+
+final_dmrs <- fread(final_dmr_file)
+
+## Use the balanced testing dataframe
+## This keeps the rest of the code close to the TCGA full version.
+test_df_balanced <- as.data.frame(test_df_balanced)
+
+dim(test_df_balanced)
+table(test_df_balanced$group)
+dim(final_dmrs)
+
+############################################################
+## Module 3. Select final model and extract model features
+############################################################
+
+## Based on your previous TCGA testing results, radial SVM performed best.
+final_model <- model_svm
+final_model_name <- "Radial SVM"
+
+print(final_model$bestTune)
+
+## Extract the predictor names used to train the final model.
+## ".outcome" is the response variable stored by caret, so it is excluded.
+features_svm <- setdiff(
+  colnames(final_model$trainingData),
+  ".outcome"
+)
+
+length(features_svm)
+head(features_svm, 10)
+
+## Check all model features are present in TCGA balanced data
+stopifnot(all(features_svm %in% colnames(test_df_balanced)))
+length(setdiff(features_svm, colnames(test_df_balanced))) == 0
+
+############################################################
+## Module 4. Prepare TCGA balanced data for SHAP
+############################################################
+
+## x_explain contains only DMR features.
+## This should be TCGA balanced samples x 110 DMRs.
+x_explain <- test_df_balanced[, features_svm, drop = FALSE]
+x_explain <- as.data.frame(x_explain)
+
+head(rownames(x_explain))
+
+## Standardise group order for plotting.
+## SHAP will explain predicted probability of Tumor.
+test_df_balanced$group <- factor(
+  as.character(test_df_balanced$group),
+  levels = c("Normal", "Tumor")
+)
+
+check_dataframe <- data.frame(
+  Sample = rownames(test_df_balanced),
+  group = test_df_balanced$group
+)
+
+head(check_dataframe)
+tail(check_dataframe)
+
+############################################################
+## Module 5. Define prediction wrapper for SHAP
+############################################################
+
+## SHAP needs a prediction function.
+## Here we explain predicted probability of Tumor.
+##
+## Interpretation:
+##   SHAP value > 0 means this DMR pushes prediction towards Tumor.
+##   SHAP value < 0 means this DMR pushes prediction towards Normal.
+pred_wrapper_svm <- function(object, newdata) {
+  
+  newdata <- as.data.frame(newdata)
+  
+  newdata <- newdata[, features_svm, drop = FALSE]
+  
+  predict(
+    object,
+    newdata = newdata,
+    type = "prob"
+  )[, "Tumor"]
+}
+
+############################################################
+## Module 6. Run SHAP for ALL 110 DMRs
+############################################################
+
+## Important:
+##   Run SHAP on all 110 DMRs first.
+##   Then rank all 110 DMRs.
+##   Then select top 10.
+##
+## For quick testing, use nsim_shap <- 10.
+## For final results, use 50 or 100.
+nsim_shap <- 10
+
+set.seed(123)
+
+shap_svm_balanced <- fastshap::explain(
+  object = final_model,
+  X = x_explain,
+  pred_wrapper = pred_wrapper_svm,
+  nsim = nsim_shap,
+  adjust = TRUE
+)
+
+shap_svm_balanced <- as.data.frame(shap_svm_balanced)
+
+print(dim(shap_svm_balanced))
+
+save(
+  shap_svm_balanced,
+  file = file.path(outdir, "radial_SVM_SHAP_values_all_110_DMRs_TCGA_balanced.Rdata")
+)
+
+############################################################
+## Module 7. Summarise SHAP importance for each DMR
+############################################################
+
+## mean_abs_SHAP:
+##   average absolute contribution of each DMR across all TCGA balanced samples.
+##   Higher mean_abs_SHAP = more important for model prediction.
+shap_importance_balanced <- data.table(
+  Feature = colnames(shap_svm_balanced),
+  mean_abs_SHAP_balanced = colMeans(abs(shap_svm_balanced), na.rm = TRUE),
+  mean_SHAP_balanced = colMeans(shap_svm_balanced, na.rm = TRUE)
+)
+
+setorder(shap_importance_balanced, -mean_abs_SHAP_balanced)
+
+shap_importance_balanced[, SHAP_rank_balanced := seq_len(.N)]
+
+head(shap_importance_balanced, 10)
+
+fwrite(
+  shap_importance_balanced,
+  file = file.path(outdir, "radial_SVM_SHAP_importance_all_110_DMRs_TCGA_balanced.csv")
+)
+
+############################################################
+## Module 8. Merge SHAP ranking with the final DMR information
+############################################################
+
+## In your current final DMR table, Feature names are matched to DMR_ID.
+## Example:
+##   Feature = DMR_7
+##   DMR_ID  = DMR_7
+
+final_priority_table_balanced <- merge(
+  shap_importance_balanced,
+  final_dmrs,
+  by.x = "Feature",
+  by.y = "DMR_ID",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+## Restore SHAP ranking order
+setorder(final_priority_table_balanced, SHAP_rank_balanced)
+
+dim(final_priority_table_balanced)
+head(final_priority_table_balanced)
+
+############################################################
+## Module 9. Calculate TCGA balanced delta beta for each DMR feature
+############################################################
+
+## TCGA_balanced_deltaBeta:
+##   mean beta in Tumor - mean beta in Normal
+##
+## For your hypermethylated DMRs, this should usually be positive.
+calc_tcga_balanced_delta <- function(feature) {
+  
+  values <- as.numeric(test_df_balanced[[feature]])
+  group <- test_df_balanced$group
+  
+  normal_values <- values[group == "Normal"]
+  tumor_values <- values[group == "Tumor"]
+  
+  mean_normal <- mean(normal_values, na.rm = TRUE)
+  mean_tumor <- mean(tumor_values, na.rm = TRUE)
+  delta_beta <- mean_tumor - mean_normal
+  
+  p_value <- tryCatch(
+    wilcox.test(tumor_values, normal_values)$p.value,
+    error = function(e) NA_real_
+  )
+  
+  data.table(
+    Feature = feature,
+    TCGA_balanced_mean_Normal = mean_normal,
+    TCGA_balanced_mean_Tumor = mean_tumor,
+    TCGA_balanced_deltaBeta = delta_beta,
+    TCGA_balanced_wilcox_p = p_value
+  )
+}
+
+tcga_balanced_delta_table <- rbindlist(
+  lapply(features_svm, calc_tcga_balanced_delta),
+  fill = TRUE
+)
+
+tcga_balanced_delta_table[
+  ,
+  TCGA_balanced_FDR := p.adjust(TCGA_balanced_wilcox_p, method = "BH")
+]
+
+fwrite(
+  tcga_balanced_delta_table,
+  file = file.path(outdir, "TCGA_balanced_deltaBeta_all_110_DMRs.csv")
+)
+
+head(tcga_balanced_delta_table)
+
+############################################################
+## Module 10. Merge SHAP + TCGA balanced delta + final DMR evidence
+############################################################
+
+priority_table_balanced <- merge(
+  final_priority_table_balanced,
+  tcga_balanced_delta_table,
+  by = "Feature",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+## Move key ranking and validation columns to the front
+key_cols <- intersect(
+  c(
+    "SHAP_rank_balanced",
+    "Feature",
+    "mean_abs_SHAP_balanced",
+    "TCGA_balanced_mean_Normal",
+    "TCGA_balanced_mean_Tumor",
+    "TCGA_balanced_deltaBeta",
+    "TCGA_balanced_wilcox_p",
+    "TCGA_balanced_FDR",
+    "DMR_coordinate",
+    "chr",
+    "start",
+    "end",
+    "DMR_length"
+  ),
+  colnames(priority_table_balanced)
+)
+
+setcolorder(
+  priority_table_balanced,
+  c(
+    key_cols,
+    setdiff(colnames(priority_table_balanced), key_cols)
+  )
+)
+
+dim(priority_table_balanced)
+head(priority_table_balanced)
+
+fwrite(
+  priority_table_balanced,
+  file = file.path(outdir, "SHAP_TCGA_balanced_validation_background_all_110_DMRs.csv")
+)
+
+############################################################
+## Module 11. Build SHAP-discovery delta priority score
+############################################################
+
+## The final priority score uses:
+##   60% SHAP importance in TCGA balanced cohort
+##   40% mean delta beta across the discovery datasets
+##
+## The priority score is only used to rank DMR candidates.
+## It is not a p-value or statistical significance measure.
+
+priority_table_balanced_scored <- copy(priority_table_balanced)
+
+############################################################
+## Define a function to scale values between 0 and 1
+############################################################
+
+scale01 <- function(x) {
+  
+  x <- as.numeric(x)
+  
+  if (all(is.na(x))) {
+    return(rep(0, length(x)))
+  }
+  
+  rng <- range(x, na.rm = TRUE)
+  
+  if (!all(is.finite(rng)) || rng[1] == rng[2]) {
+    
+    out <- rep(0.5, length(x))
+    
+  } else {
+    
+    out <- (x - rng[1]) / (rng[2] - rng[1])
+  }
+  
+  out[is.na(out)] <- 0
+  
+  return(out)
+}
+
+## Convert SHAP importance to a 0-1 score.
+priority_table_balanced_scored[
+  ,
+  score_SHAP_balanced := scale01(mean_abs_SHAP_balanced)
+]
+
+## Convert discovery delta beta to a 0-1 score.
+priority_table_balanced_scored[
+  ,
+  score_discovery_delta := scale01(discovery_deltaBeta)
+]
+
+## Calculate the combined priority score.
+priority_table_balanced_scored[
+  ,
+  priority_score_balanced :=
+    0.60 * score_SHAP_balanced +
+    0.40 * score_discovery_delta
+]
+
+## Rank DMR candidates.
+## If two DMRs have the same score:
+##   1. higher mean_abs_SHAP_balanced ranks first;
+##   2. if still tied, higher discovery_deltaBeta ranks first.
+setorder(
+  priority_table_balanced_scored,
+  -priority_score_balanced,
+  -mean_abs_SHAP_balanced,
+  -discovery_deltaBeta
+)
+
+priority_table_balanced_scored[
+  ,
+  priority_rank_balanced := seq_len(.N)
+]
+
+############################################################
+## Rank comparison: SHAP-only vs combined priority ranking
+############################################################
+
+ranking_comparison_balanced <- priority_table_balanced_scored[
+  ,
+  .(
+    Feature,
+    SHAP_rank_balanced,
+    priority_rank_balanced,
+    mean_abs_SHAP_balanced,
+    discovery_deltaBeta,
+    score_SHAP_balanced,
+    score_discovery_delta,
+    priority_score_balanced
+  )
+]
+
+ranking_comparison_balanced[
+  ,
+  rank_change_balanced := SHAP_rank_balanced - priority_rank_balanced
+]
+
+setorder(ranking_comparison_balanced, priority_rank_balanced)
+
+head(ranking_comparison_balanced, 20)
+
+fwrite(
+  priority_table_balanced,
+  file = file.path(outdir, "SHAP_TCGA_balanced_validation_background_all_110_DMRs.csv")
+)
+
+fwrite(
+  priority_table_balanced_scored,
+  file = file.path(outdir, "SHAP_discovery_delta_scored_all_110_DMRs_TCGA_balanced.csv")
+)
+
+fwrite(
+  ranking_comparison_balanced,
+  file = file.path(outdir, "SHAP_vs_combined_priority_ranking_comparison_TCGA_balanced.csv")
+)
+
+############################################################
+## Module 12. Select final top 10 DMRs for wet-lab validation
+############################################################
+
+top10_dmrs_balanced <- priority_table_balanced_scored[
+  priority_rank_balanced <= 10
+]
+
+setorder(top10_dmrs_balanced, priority_rank_balanced)
+
+fwrite(
+  top10_dmrs_balanced,
+  file = file.path(outdir, "Final_top10_DMRs_for_wetlab_validation_TCGA_balanced.csv")
+)
+
+############################################################
+## Module 13. Visualization
+############################################################
+
+## Arrange the selected DMRs from rank 1 to rank 10.
+setorder(top10_dmrs_balanced, priority_rank_balanced)
+
+## Create a consistent label for all plots.
+top10_dmrs_balanced[
+  ,
+  DMR_label := paste0("Rank ", priority_rank_balanced, ": ", Feature)
+]
+
+## Reverse the factor levels so that rank 1 appears at the top
+## of horizontal bar plots and SHAP summary plots.
+top10_dmrs_balanced[
+  ,
+  DMR_label := factor(DMR_label, levels = rev(DMR_label))
+]
+
+############################################################
+## Plot 1. Combined priority score barplot
+############################################################
+
+p_priority_bar_balanced <- ggplot(
+  top10_dmrs_balanced,
+  aes(
+    x = priority_score_balanced,
+    y = DMR_label
+  )
+) +
+  geom_col(
+    width = 0.7,
+    fill = "grey40"
+  ) +
+  geom_text(
+    aes(
+      label = sprintf("%.3f", priority_score_balanced)
+    ),
+    hjust = -0.12,
+    size = 3.5
+  ) +
+  expand_limits(
+    x = max(
+      top10_dmrs_balanced$priority_score_balanced,
+      na.rm = TRUE
+    ) * 1.15
+  ) +
+  labs(
+    title = "Final top 10 DMRs by combined priority score",
+    subtitle = "TCGA balanced cohort: 60% SHAP importance + 40% discovery delta beta",
+    x = "Combined priority score",
+    y = "DMR"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank()
+  )
+
+print(p_priority_bar_balanced)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_combined_priority_score_barplot_TCGA_balanced.png"),
+  plot = p_priority_bar_balanced,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_combined_priority_score_barplot_TCGA_balanced.pdf"),
+  plot = p_priority_bar_balanced,
+  width = 10,
+  height = 7
+)
+
+############################################################
+## Plot 2. Visualise the two weighted score components
+############################################################
+
+top10_dmrs_balanced[
+  ,
+  weighted_SHAP_balanced := 0.60 * score_SHAP_balanced
+]
+
+top10_dmrs_balanced[
+  ,
+  weighted_discovery_delta := 0.40 * score_discovery_delta
+]
+
+top10_dmrs_balanced[
+  ,
+  score_check := weighted_SHAP_balanced + weighted_discovery_delta
+]
+
+cat("\nMaximum difference between priority_score_balanced and score_check:\n")
+
+print(
+  max(
+    abs(
+      top10_dmrs_balanced$priority_score_balanced -
+        top10_dmrs_balanced$score_check
+    ),
+    na.rm = TRUE
+  )
+)
+
+component_plot_df_balanced <- melt(
+  top10_dmrs_balanced,
+  id.vars = c(
+    "Feature",
+    "priority_rank_balanced",
+    "DMR_label",
+    "priority_score_balanced"
+  ),
+  measure.vars = c(
+    "weighted_SHAP_balanced",
+    "weighted_discovery_delta"
+  ),
+  variable.name = "Score_component",
+  value.name = "Weighted_contribution"
+)
+
+component_plot_df_balanced[
+  ,
+  Score_component := factor(
+    Score_component,
+    levels = c(
+      "weighted_SHAP_balanced",
+      "weighted_discovery_delta"
+    ),
+    labels = c(
+      "SHAP contribution (60%)",
+      "Discovery delta contribution (40%)"
+    )
+  )
+]
+
+p_component_bar_balanced <- ggplot(
+  component_plot_df_balanced,
+  aes(
+    x = Weighted_contribution,
+    y = DMR_label,
+    fill = Score_component
+  )
+) +
+  geom_col(
+    width = 0.7
+  ) +
+  geom_text(
+    data = top10_dmrs_balanced,
+    aes(
+      x = priority_score_balanced,
+      y = DMR_label,
+      label = sprintf("%.3f", priority_score_balanced)
+    ),
+    inherit.aes = FALSE,
+    hjust = -0.12,
+    size = 3.4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "SHAP contribution (60%)" = "#4C78A8",
+      "Discovery delta contribution (40%)" = "#F58518"
+    )
+  ) +
+  expand_limits(
+    x = max(
+      top10_dmrs_balanced$priority_score_balanced,
+      na.rm = TRUE
+    ) * 1.15
+  ) +
+  labs(
+    title = "Contribution to the final priority score",
+    subtitle = "TCGA balanced cohort: weighted SHAP and discovery delta-beta components",
+    x = "Weighted contribution",
+    y = "DMR",
+    fill = "Score component"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank(),
+    legend.position = "top"
+  )
+
+print(p_component_bar_balanced)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_priority_score_components_TCGA_balanced.png"),
+  plot = p_component_bar_balanced,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_priority_score_components_TCGA_balanced.pdf"),
+  plot = p_component_bar_balanced,
+  width = 10,
+  height = 7
+)
+
+############################################################
+## Plot 3. SHAP summary beeswarm for the final top 10 DMRs
+############################################################
+
+selected_features_shap <- as.character(
+  top10_dmrs_balanced$Feature
+)
+
+selected_features_shap <- selected_features_shap[
+  selected_features_shap %in% colnames(shap_svm_balanced)
+]
+
+selected_label_map_shap <- top10_dmrs_balanced[
+  Feature %in% selected_features_shap,
+  .(
+    Feature,
+    priority_rank_balanced,
+    DMR_label
+  )
+]
+
+selected_label_map_shap[
+  ,
+  DMR_label := as.character(DMR_label)
+]
+
+sample_ids_shap <- rownames(x_explain)
+
+if (is.null(sample_ids_shap)) {
+  sample_ids_shap <- paste0(
+    "Sample_",
+    seq_len(nrow(x_explain))
+  )
+}
+
+shap_dt <- as.data.table(
+  shap_svm_balanced[
+    ,
+    selected_features_shap,
+    drop = FALSE
+  ]
+)
+
+shap_dt[, Sample := sample_ids_shap]
+
+shap_long <- melt(
+  shap_dt,
+  id.vars = "Sample",
+  measure.vars = selected_features_shap,
+  variable.name = "Feature",
+  value.name = "SHAP_value"
+)
+
+beta_dt <- as.data.table(
+  as.data.frame(x_explain)[
+    ,
+    selected_features_shap,
+    drop = FALSE
+  ]
+)
+
+beta_dt[, Sample := sample_ids_shap]
+
+beta_long <- melt(
+  beta_dt,
+  id.vars = "Sample",
+  measure.vars = selected_features_shap,
+  variable.name = "Feature",
+  value.name = "DMR_beta"
+)
+
+shap_plot_df_balanced <- merge(
+  shap_long,
+  beta_long,
+  by = c(
+    "Sample",
+    "Feature"
+  ),
+  all.x = TRUE
+)
+
+shap_plot_df_balanced <- merge(
+  shap_plot_df_balanced,
+  selected_label_map_shap[
+    ,
+    .(
+      Feature,
+      priority_rank_balanced,
+      DMR_label
+    )
+  ],
+  by = "Feature",
+  all.x = TRUE
+)
+
+label_order_shap <- selected_label_map_shap[
+  order(priority_rank_balanced),
+  DMR_label
+]
+
+shap_plot_df_balanced[
+  ,
+  DMR_label := factor(
+    DMR_label,
+    levels = rev(label_order_shap)
+  )
+]
+
+p_shap_beeswarm_balanced <- ggplot(
+  shap_plot_df_balanced,
+  aes(
+    x = SHAP_value,
+    y = DMR_label,
+    color = DMR_beta
+  )
+) +
+  ggbeeswarm::geom_quasirandom(
+    groupOnX = FALSE,
+    alpha = 0.75,
+    size = 1.2,
+    width = 0.25
+  ) +
+  scale_color_gradient(
+    low = "#2C7BB6",
+    high = "#D7191C"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  labs(
+    title = "SHAP summary plot for the final top 10 DMRs",
+    subtitle = "TCGA balanced cohort: top 10 selected using SHAP importance and discovery delta beta",
+    x = "SHAP value for predicted Tumor probability",
+    y = "DMR",
+    color = "DMR beta"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.y = element_text(size = 9)
+  )
+
+print(p_shap_beeswarm_balanced)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_SHAP_summary_beeswarm_TCGA_balanced.png"),
+  plot = p_shap_beeswarm_balanced,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_SHAP_summary_beeswarm_TCGA_balanced.pdf"),
+  plot = p_shap_beeswarm_balanced,
+  width = 10,
+  height = 7
+)
+
+############################################################
+## Plot 4. TCGA balanced beta boxplot and beeswarm for final top 10
+############################################################
+
+selected_features_beta <- as.character(
+  top10_dmrs_balanced$Feature
+)
+
+selected_features_beta <- selected_features_beta[
+  selected_features_beta %in% colnames(test_df_balanced)
+]
+
+selected_label_map_beta <- top10_dmrs_balanced[
+  Feature %in% selected_features_beta,
+  .(
+    Feature,
+    priority_rank_balanced,
+    DMR_label
+  )
+]
+
+selected_label_map_beta[
+  ,
+  DMR_label := as.character(DMR_label)
+]
+
+test_df_plot <- as.data.frame(test_df_balanced)
+
+sample_ids_beta <- rownames(test_df_plot)
+
+if (is.null(sample_ids_beta)) {
+  sample_ids_beta <- paste0(
+    "Sample_",
+    seq_len(nrow(test_df_plot))
+  )
+}
+
+beta_selected_dt <- as.data.table(
+  test_df_plot[
+    ,
+    c(
+      "group",
+      selected_features_beta
+    ),
+    drop = FALSE
+  ]
+)
+
+beta_selected_dt[, Sample := sample_ids_beta]
+
+beta_selected_long_balanced <- melt(
+  beta_selected_dt,
+  id.vars = c(
+    "Sample",
+    "group"
+  ),
+  measure.vars = selected_features_beta,
+  variable.name = "Feature",
+  value.name = "DMR_beta"
+)
+
+beta_selected_long_balanced <- merge(
+  beta_selected_long_balanced,
+  selected_label_map_beta[
+    ,
+    .(
+      Feature,
+      priority_rank_balanced,
+      DMR_label
+    )
+  ],
+  by = "Feature",
+  all.x = TRUE
+)
+
+beta_selected_long_balanced[
+  ,
+  group := factor(
+    as.character(group),
+    levels = c("Normal", "Tumor")
+  )
+]
+
+label_order_beta <- selected_label_map_beta[
+  order(priority_rank_balanced),
+  DMR_label
+]
+
+beta_selected_long_balanced[
+  ,
+  DMR_label := factor(
+    DMR_label,
+    levels = label_order_beta
+  )
+]
+
+p_beta_box_beeswarm_balanced <- ggplot(
+  beta_selected_long_balanced,
+  aes(
+    x = group,
+    y = DMR_beta,
+    color = group,
+    fill = group
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.25,
+    width = 0.55
+  ) +
+  ggbeeswarm::geom_quasirandom(
+    width = 0.18,
+    alpha = 0.55,
+    size = 1.1
+  ) +
+  facet_wrap(
+    ~ DMR_label,
+    ncol = 2,
+    scales = "free_y"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Normal" = "#2C7BB6",
+      "Tumor" = "#D7191C"
+    )
+  ) +
+  labs(
+    title = "TCGA balanced confirmation of the final top 10 DMRs",
+    subtitle = "Final candidates selected using SHAP and discovery delta beta",
+    x = NULL,
+    y = "DMR mean beta value",
+    color = "Group",
+    fill = "Group"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    legend.position = "top"
+  )
+
+print(p_beta_box_beeswarm_balanced)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_TCGA_balanced_beta_boxplot_beeswarm.png"),
+  plot = p_beta_box_beeswarm_balanced,
+  width = 11,
+  height = 12,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(outdir, "final_top10_TCGA_balanced_beta_boxplot_beeswarm.pdf"),
+  plot = p_beta_box_beeswarm_balanced,
+  width = 11,
+  height = 12
+)
+
+############################################################
+## Module 14. Save all balanced prioritisation objects
+############################################################
+
+save(
+  priority_table_balanced,
+  priority_table_balanced_scored,
+  ranking_comparison_balanced,
+  top10_dmrs_balanced,
+  component_plot_df_balanced,
+  shap_plot_df_balanced,
+  beta_selected_long_balanced,
+  p_priority_bar_balanced,
+  p_component_bar_balanced,
+  p_shap_beeswarm_balanced,
+  p_beta_box_beeswarm_balanced,
+  file = file.path(outdir, "final_top10_DMR_visualisation_results_TCGA_balanced.Rdata")
+)
+```
