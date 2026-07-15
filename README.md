@@ -20,7 +20,7 @@ The pipeline follows a stepwise marker discovery and prioritisation strategy:
 ---
 
 ## Workflow
-step1-step2-step3-step3.1-step4
+step1-step2-step3-step3.1-step4-step5
 
 
 Three GEO EPIC/850K discovery datasets
