@@ -1,0 +1,37 @@
+# R session / RStudio files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# R project temporary files
+*.Rproj.user
+
+# Large GEO / TCGA / methylation raw data
+*.tsv.gz
+*.txt.gz
+*.csv.gz
+*.idat
+*.idat.gz
+
+# R binary output files
+*.Rdata
+*.RData
+*.rds
+*.RDS
+
+# Log files
+*.log
+
+# Temporary / cache files
+*.tmp
+*.cache
+*.bak
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Optional large output folders
+step4.Machine_learning/ML_239DMR_GSE101764_train_TCGA_test_outputs/
+step5.SHAP_priority_panel_selection/
