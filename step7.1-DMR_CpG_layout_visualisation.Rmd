@@ -1,0 +1,780 @@
+---
+title: "Step 7.1 - DMR CpG layout visualisation"
+author: "Yanni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Step 7.1 Purpose of DMR CpG layout visualisation
+This step generates publication-style CpG genomic layout plots for the prioritised DMR candidates.
+
+The visualisation integrates:
+
+Consensus representative CpG ranking results
+Original DMRcate EPIC probe coordinates
+Genomic positions of constituent CpG probes
+
+Each DMR will be visualised separately, showing:
+
+DMR genomic interval
+All constituent CpG probes
+Consensus representative rank of each CpG
+Future primer/amplicon annotation space for assay design
+
+### Clear environment and define output directory
+```{r }
+rm(list = ls())
+outdir <- "step7.1_probes_visualisation"
+
+
+if(!dir.exists(outdir)){
+  
+  dir.create(
+    outdir,
+    recursive = TRUE
+  )
+}
+
+```
+### Load required packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(svglite)
+
+```
+### Load consensus probe ranking table and EPIC probe coordinate mapping table and Check required columns
+```{r}
+probe_rank <- fread(
+  "Top20_DMR_probe_consensus_ranking_across_discovery_datasets.csv")
+probe_mapping <- fread(
+  "Top20_priority_DMR_actual_EPIC_probes_used_by_DMRcate_nsim500.csv")
+
+
+required_rank_columns <- c(
+  
+  "Current_DMR_ID",
+  "CpG",
+  "Consensus_representative_rank")
+
+required_mapping_columns <- c(
+  
+  "DMR_ID",
+  "probe_id",
+  "probe_chr",
+  "probe_position",
+  "start",
+  "end")
+
+if(
+  !all(required_rank_columns %in% colnames(probe_rank))
+){
+  
+  stop("Missing required columns in probe ranking table.")}
+
+
+if(
+  !all(required_mapping_columns %in% colnames(probe_mapping))
+){
+  
+  stop("Missing required columns in probe mapping table.")}
+```
+### Standardise probe coordinate table
+Rename genomic coordinate columns to create a consistent structure for downstream plotting.
+The final identifier format:Current_DMR_ID + CpG
+```{r}
+mapping_for_plot <- probe_mapping[
+  
+  ,
+  
+  .(
+    
+    Current_DMR_ID = DMR_ID,
+    
+    CpG = probe_id,
+    
+    chr = probe_chr,
+    
+    position = probe_position,
+    
+    DMR_start = start,
+    
+    DMR_end = end)]
+```
+### Merge probe ranking with genomic coordinates
+Combine:
+Consensus representative ranking information
+CpG genomic location information
+After merging, each CpG contains:
+DMR identity
+CpG ID
+genomic coordinate
+consensus rank
+```{r}
+plot_data <- merge(
+  
+  probe_rank,
+  
+  mapping_for_plot,
+  
+  by = c(
+    "Current_DMR_ID",
+    "CpG"
+  ),
+  
+  all.x = TRUE)
+cat("Merged plotting dataset:",
+  nrow(plot_data),
+  "rows x",
+  ncol(plot_data),
+  "columns\n")
+```
+### Validate genomic coordinate matching
+Check whether all ranked CpGs have successfully matched EPIC probe coordinates.
+```{r}
+missing_position <- sum(is.na(plot_data$position))
+cat("CpGs without genomic position:",
+  missing_position,
+  "\n")
+if(missing_position > 0){
+  
+  warning("Some CpGs could not be matched with genomic coordinates.")}
+```
+### Arrange plotting dataset
+Order CpGs by:DMR identity ; Genomic position
+
+This ordering will be used for genomic layout visualisation.
+```{r}
+setorder(plot_data,
+  
+  Current_DMR_ID,
+  
+  position)
+
+plot_data[
+  ,
+  Consensus_representative_rank :=
+    as.numeric(Consensus_representative_rank)]
+```
+### Generate DMR summary table
+Generate a DMR-level summary containing:
+number of CpGs
+chromosome
+genomic interval
+```{r}
+dmr_summary <- plot_data[
+  
+  ,
+  
+  .(n_CpGs = .N,
+    
+    chr = unique(chr),
+    
+    DMR_start = unique(DMR_start),
+    
+    DMR_end = unique(DMR_end)),
+  by = Current_DMR_ID]
+dmr_summary
+```
+### save plotting datasets
+```{r}
+fwrite(plot_data,
+  file.path(outdir,
+    "DMR_CpG_layout_plotting_dataset.csv"))
+
+fwrite(dmr_summary,
+  file.path(outdir,
+    "DMR_CpG_layout_summary.csv"))
+```
+### Prepare plotting data for individual DMR
+This function extracts CpG probes belonging to one selected DMR and assigns vertical positions for the lollipop-style genomic layout.
+
+The plotting design includes:
+
+- two-level CpG heights to reduce overlap
+- compact CpG track layout
+- reserved upper space for future primer/amplicon annotation
+```{r prepare-single-DMR-function}
+## Prepare plotting data for individual DMR
+## Purpose:
+## Extract CpG probes belonging to one selected DMR and
+## prepare lollipop plot coordinates.
+## Visualisation strategy:
+## 1. CpG number controls vertical layers:
+##    <=15 CpGs  : 2 layers
+##    >15 CpGs   : 3 layers
+## 2. Genomic coordinates are retained.
+## 3. Closely located CpGs (<50 bp) receive small horizontal
+##    offsets only for visualisation to reduce overlap.
+prepare_single_DMR_plot_data <- function(
+  plot_data,
+  selected_DMR
+){
+  ## Extract CpG information for selected DMR
+  dmr_plot_data <- copy(
+    
+    plot_data[
+      Current_DMR_ID == selected_DMR])
+  
+  if(
+    nrow(dmr_plot_data) == 0
+  ){
+    
+    stop(
+      paste("No data found for",
+        selected_DMR))}
+  ## Arrange CpGs according to genomic position
+  setorder(
+    dmr_plot_data,
+    position
+  )
+  ## Count CpGs within selected DMR
+  n_CpGs <- nrow(
+    dmr_plot_data
+  )
+  ## Determine number of vertical layers
+  if(
+    n_CpGs <= 15
+  ){
+    
+    n_layers <- 2
+    
+    
+  }else{
+    
+    n_layers <- 3
+    
+  }
+  ## Assign CpGs into vertical layers
+  ## CpGs are sequentially distributed according to genomic
+  ## order.
+  dmr_plot_data[
+    ,
+    plot_layer :=
+      seq_len(.N) %% n_layers
+  ]
+  
+  ## Convert layer number into plotting height
+  
+  if(
+    n_layers == 2
+  ){
+    
+    height_levels <- c(
+      0.12,
+      0.22
+    )
+    
+    
+  }else{
+    
+    height_levels <- c(
+      0.10,
+      0.18,
+      0.26
+    )
+    
+  }
+  
+  dmr_plot_data[
+    ,
+    plot_y :=
+      height_levels[
+        plot_layer + 1
+      ]
+  ]
+  
+  ## Add horizontal jitter for closely located CpGs
+  ## Genomic position is preserved.
+  ## plot_x is only used for visualisation.
+  dmr_plot_data[
+    ,
+    plot_x := position
+  ]
+  
+  
+  
+  close_threshold <- 50
+  
+  
+  for(i in seq_len(nrow(dmr_plot_data)-1)){
+    
+    
+    if(
+      abs(
+        dmr_plot_data$position[i+1] -
+        dmr_plot_data$position[i]
+      ) < close_threshold
+    ){
+      
+      
+      dmr_plot_data$plot_x[i+1] <-
+        
+        dmr_plot_data$plot_x[i] + 20
+      
+    }
+    
+    
+  }
+  
+  ## Extract DMR genomic information
+  dmr_start <- unique(
+    dmr_plot_data$DMR_start
+  )
+  
+  
+  dmr_end <- unique(
+    dmr_plot_data$DMR_end
+  )
+  
+  
+  dmr_chr <- unique(dmr_plot_data$chr)
+  priority_rank <- unique(
+    dmr_plot_data$priority_rank
+  )
+  ## Generate plot title
+  ## Example:
+  ## Rank 1: DMR_33 | chr6:62995523-62997123
+  coordinate <- paste0(
+    
+    dmr_chr,
+    
+    ":",
+    
+    dmr_start,
+    
+    "-",
+    
+    dmr_end)
+  plot_title <- paste0(
+    
+    "Rank ",
+    
+    priority_rank,
+    
+    ": ",
+    
+    selected_DMR,
+    
+    " | ",
+    
+    coordinate)
+  ## Return plotting objects
+  return(
+    
+    list(
+      
+      dmr_plot_data = dmr_plot_data,
+      
+      dmr_start = dmr_start,
+      
+      dmr_end = dmr_end,
+      
+      plot_title = plot_title))}
+```
+
+### Generate single DMR lollipop plot function
+This function generates one CpG layout plot for a selected DMR.
+The plot contains:
+DMR genomic region baseline
+CpG genomic positions
+lollipop stems
+white CpG circles
+consensus rank displayed inside each circle
+```{r}
+plot_single_DMR_layout <- function(
+  plot_data,
+  selected_DMR
+){
+  ## Prepare plotting data
+  prepared <- prepare_single_DMR_plot_data(
+    
+    plot_data = plot_data,
+    
+    selected_DMR = selected_DMR)
+  dmr_plot_data <- prepared$dmr_plot_data
+  
+  dmr_start <- prepared$dmr_start
+  
+  dmr_end <- prepared$dmr_end
+  
+  plot_title <- prepared$plot_title
+  ## Add x-axis padding
+  ## Prevent CpGs close to DMR boundaries from touching
+  ## the edge of the figure.
+  x_padding <- max(
+    
+    20,
+    
+    round((dmr_end - dmr_start) * 0.05))
+  ## Generate lollipop plot
+  p <- ggplot() +
+    ## DMR genomic baseline
+    geom_segment(
+      
+      aes(
+        
+        x = dmr_start,
+        
+        xend = dmr_end,
+        
+        y = 0,
+        
+        yend = 0
+        
+      ),
+      
+      linewidth = 1.2,
+      
+      colour = "black"
+      
+    ) +
+    ## CpG vertical stems
+    geom_segment(
+      
+      data = dmr_plot_data,
+      
+      aes(
+        
+        x = position,
+        
+        xend = position,
+        
+        y = 0,
+        
+        yend = plot_y
+        
+      ),
+      
+      linewidth = 0.9,
+      
+      colour = "black"
+      
+    ) +
+    ## CpG circles
+    geom_point(
+      
+      data = dmr_plot_data,
+      
+      aes(
+        
+        x = position,
+        
+        y = plot_y
+        
+      ),
+      
+      shape = 21,
+      
+      fill = "white",
+      
+      colour = "black",
+      
+      size = 4.6,
+      
+      stroke = 0.8
+      
+    ) +
+    ## Consensus rank labels inside CpG circles
+    geom_text(
+      
+      data = dmr_plot_data,
+      
+      aes(
+        
+        x = position,
+        
+        y = plot_y,
+        
+        label = Consensus_representative_rank
+        
+      ),
+      
+      size = 2.8,
+      
+      colour = "black"
+      
+    ) +
+    ## Axis scaling
+    ## Upper space is reserved for future primer annotation.
+    scale_x_continuous(
+      
+      limits = c(
+        
+        dmr_start - x_padding,
+        
+        dmr_end + x_padding
+        
+      ),
+      
+      expand = c(
+        0,
+        0
+      )
+      
+    ) +
+    scale_y_continuous(
+      
+      limits = c(
+        
+        -0.03,
+        
+        0.50
+        
+      ),
+      
+      expand = c(
+        0,
+        0
+      )
+      
+    ) +
+    ## Figure labels
+    labs(
+      
+      title = plot_title,
+      
+      x = "Genomic position",
+      
+      y = NULL
+      
+    ) +
+    ## Figure theme
+    theme_classic(
+      base_size = 14
+    ) +
+    
+    theme(
+      
+      plot.title = element_text(
+        
+        face = "bold",
+        
+        size = 16
+        
+      ),
+      
+      axis.title.x = element_text(
+        
+        size = 14
+        
+      ),
+      
+      axis.text.x = element_text(
+        
+        size = 11
+        
+      ),
+      
+      axis.text.y = element_blank(),
+      
+      axis.ticks.y = element_blank(),
+      
+      axis.line.y = element_blank(),
+      
+      plot.margin = margin(
+        
+        t = 12,
+        
+        r = 15,
+        
+        b = 10,
+        
+        l = 15))
+return(p)
+}
+```
+### Test one example DMR
+Before generating all Top 20 DMR figures, visually confirm:
+title format
+CpG spacing
+rank labels
+reserved primer space
+```{r}
+## Test plotting function using one example DMR
+example_DMR <- "DMR_61"
+p_DMR61 <- plot_single_DMR_layout(
+  
+  plot_data = plot_data,
+  
+  selected_DMR = example_DMR)
+p_DMR61
+```
+### Create figure output directories
+Create separate folders for PDF and SVG output formats.
+SVG format will be used for:
+Illustrator editing
+poster figure assembly
+manual primer annotation
+PDF format will be used for:
+manuscript supplementary figures
+high-quality vector export
+```{r}
+pdf_dir <- file.path(outdir,"PDF")
+
+svg_dir <- file.path(outdir,"SVG")
+
+if(
+  !dir.exists(pdf_dir)){dir.create(
+    pdf_dir,
+    recursive = TRUE)}
+
+if(!dir.exists(svg_dir)){dir.create(
+    svg_dir,
+    recursive = TRUE)}
+```
+### Define DMR list for plotting
+Extract all candidate DMR IDs included in the probe prioritisation analysis.
+Each DMR will generate one independent genomic layout figure.
+```{r}
+DMR_to_plot <- unique(plot_data$Current_DMR_ID)
+cat("Number of DMRs to plot:",
+  length(DMR_to_plot),
+  "\n")
+print(DMR_to_plot)
+```
+### Generate and save all DMR plots
+Loop through all prioritised DMRs and save:PDF figures & SVG figures
+
+Each figure contains:DMR genomic region；CpG positions；Consensus representative ranks
+```{r}
+figure_index <- data.table()
+for(
+  this_DMR in DMR_to_plot
+){
+  ## Generate plot
+  p_current <- plot_single_DMR_layout(
+    
+    plot_data = plot_data,
+    
+    selected_DMR = this_DMR
+    
+  )
+  ## Extract metadata for file naming
+  current_metadata <- unique(
+    
+    plot_data[
+      
+      Current_DMR_ID == this_DMR,
+      
+      .(
+        
+        priority_rank,
+        
+        chr,
+        
+        DMR_start,
+        
+        DMR_end
+        
+      )
+      
+    ]
+    
+  )
+  current_rank <- current_metadata$priority_rank[1]
+  
+  current_chr <- current_metadata$chr[1]
+  
+  current_start <- current_metadata$DMR_start[1]
+  
+  current_end <- current_metadata$DMR_end[1]
+  ## Create figure filename
+  figure_name <- paste0(
+    
+    "Rank",
+    
+    current_rank,
+    
+    "_",
+    
+    this_DMR,
+    
+    "_chr",
+    
+    current_chr,
+    
+    "_",
+    
+    current_start,
+    
+    "-",
+    
+    current_end,
+    
+    "_CpG_layout")
+  ## Save PDF
+  ggsave(filename = file.path(pdf_dir,
+      paste0(
+        figure_name,
+        ".pdf")),
+    
+    plot = p_current,
+    
+    width = 8.5,
+    
+    height = 4.5,
+    
+    units = "in")
+  ## Save SVG
+  ggsave(filename = file.path(svg_dir,
+  paste0(figure_name,".svg")
+    ),
+    
+    plot = p_current,
+    
+    width = 8.5,
+    
+    height = 4.5,
+    
+    units = "in")
+  ## Record figure information
+  figure_index <- rbind(
+    
+    figure_index,
+    
+    data.table(
+      
+      priority_rank = current_rank,
+      
+      DMR_ID = this_DMR,
+      
+      chromosome = current_chr,
+      
+      start = current_start,
+      
+      end = current_end,
+      
+      figure_name = figure_name))
+  cat("Saved:",figure_name,"\n")}
+```
+### Save figure index table
+Generate a summary table linking:
+DMR identity
+genomic coordinates
+priority ranking
+exported figure names
+This table will facilitate:
+manual figure assembly
+primer annotation
+manuscript supplementary figure preparation
+```{r}
+setorder(figure_index,priority_rank)
+fwrite(figure_index,
+  file.path(outdir,"DMR_layout_figure_index.csv"))
+figure_index
+```
+
+### Record R session information
+```{r}
+sessionInfo()
+```
+
