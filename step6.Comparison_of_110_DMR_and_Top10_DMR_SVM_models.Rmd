@@ -1,0 +1,1498 @@
+---
+title: "Comparison of 116-DMR and Top10-DMR radial SVM models"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 7
+    fig_height: 7
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This report examines whether the final top 10 DMR panel retains performance comparable to the full 116-DMR panel.
+
+Both radial SVM models are trained using the same GSE101764 samples, the same repeated cross-validation folds, and the same preprocessing and tuning strategy. They are then evaluated on the same TCGA full cohort.
+
+**Interpretation note:** the top 10 DMRs were selected using TCGA full-cohort SHAP prioritisation. Therefore, this comparison is a descriptive reduced-panel analysis rather than a fully independent external validation of the top 10 panel.
+
+# Initialise analysis
+
+This chunk starts from a clean environment and fixes the random seed.
+
+```{r initialise-analysis}
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+
+set.seed(123)
+```
+
+The same seed is used throughout the model comparison.
+
+# Load packages
+
+The required packages are loaded below.
+
+```{r load-packages}
+library(data.table)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(kernlab)
+```
+
+`caret::train()` is called explicitly later to avoid conflicts with other functions named `train`.
+
+# Define files
+
+This chunk defines the input files and output directory.
+
+```{r define-inputs}
+training_model_file <-
+  "GSE101764_ML_training_3models_116DMRs.Rdata"
+
+tcga_full_file <-
+  "TCGA_full_testing_results_3models.Rdata"
+
+top10_file <-
+  "Final_top10_DMRs_for_wetlab_validation__nsim500.csv"
+
+outdir <-
+  "step6.1_full_TCGA_top10_vs_116_performance"
+
+input_files <- c(
+  training_model_file,
+  tcga_full_file,
+  top10_file
+)
+
+if (!all(file.exists(input_files))) {
+  stop(
+    "Missing input file(s): ",
+    paste(input_files[!file.exists(input_files)], collapse = ", ")
+  )
+}
+
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+```
+
+The analysis stops if any required input file is unavailable.
+
+# Load data and model objects
+
+Only the objects required for this comparison are checked.
+
+```{r load-analysis-objects}
+load(training_model_file)
+
+if (!exists("model_svm")) {
+  stop("model_svm was not found in the training RData file.")
+}
+
+if (!exists("ml_df")) {
+  stop("ml_df was not found in the training RData file.")
+}
+
+load(tcga_full_file)
+
+if (!exists("test_df_full")) {
+  stop("test_df_full was not found in the TCGA RData file.")
+}
+
+top10_dmrs <- fread(top10_file)
+
+ml_df <- as.data.frame(ml_df)
+test_df_full <- as.data.frame(test_df_full)
+```
+
+The original SVM supplies the full 116-feature names, while `ml_df` and `test_df_full` provide training and testing data.
+
+# Prepare outcomes
+
+Tumor is placed first because it is the positive class used by `twoClassSummary()`.
+
+```{r prepare-outcomes}
+ml_df$group <- factor(
+  as.character(ml_df$group),
+  levels = c("Tumor", "Normal")
+)
+
+test_df_full$group <- factor(
+  as.character(test_df_full$group),
+  levels = c("Tumor", "Normal")
+)
+
+if (anyNA(ml_df$group) || anyNA(test_df_full$group)) {
+  stop("Unexpected or missing group labels were found.")
+}
+
+table(ml_df$group)
+table(test_df_full$group)
+```
+
+Both cohorts must contain valid Tumor and Normal labels.
+
+# Define feature panels
+
+The full feature set comes from the original radial SVM and the reduced panel comes from the corrected Step 5 result.
+
+```{r define-feature-panels}
+features_116 <- setdiff(
+  colnames(model_svm$trainingData),
+  ".outcome"
+)
+
+if (!"Feature" %in% names(top10_dmrs)) {
+  stop("The top 10 file does not contain a Feature column.")
+}
+
+features_top10 <- as.character(top10_dmrs$Feature)
+
+if (length(features_116) != 116) {
+  stop("The original radial SVM does not contain exactly 116 DMRs.")
+}
+
+if (length(features_top10) != 10) {
+  stop("The selected panel does not contain exactly 10 DMRs.")
+}
+
+if (anyDuplicated(features_top10) > 0) {
+  stop("Duplicated DMRs were found in the top 10 panel.")
+}
+
+length(features_116)
+features_top10
+```
+
+The top 10 panel must contain 10 unique DMR names.
+
+# Check feature availability
+
+This essential check confirms that all required predictors occur in both cohorts.
+
+```{r check-feature-availability}
+missing_features <- unique(c(
+  setdiff(features_116, colnames(ml_df)),
+  setdiff(features_116, colnames(test_df_full)),
+  setdiff(features_top10, colnames(ml_df)),
+  setdiff(features_top10, colnames(test_df_full))
+))
+
+if (length(missing_features) > 0) {
+  stop(
+    "Missing feature(s): ",
+    paste(missing_features, collapse = ", ")
+  )
+}
+
+if (!all(features_top10 %in% features_116)) {
+  stop("Some top 10 DMRs are not included in the 116-DMR panel.")
+}
+```
+
+The reduced model must be a true subset of the full model.
+
+# Prepare model data
+
+The two models use the same samples and outcome but different predictor panels.
+
+```{r prepare-model-data}
+train_116 <- ml_df[
+  ,
+  c("group", features_116),
+  drop = FALSE
+]
+
+train_top10 <- ml_df[
+  ,
+  c("group", features_top10),
+  drop = FALSE
+]
+
+test_116 <- test_df_full[
+  ,
+  features_116,
+  drop = FALSE
+]
+
+test_top10 <- test_df_full[
+  ,
+  features_top10,
+  drop = FALSE
+]
+
+if (anyNA(train_116) || anyNA(train_top10) ||
+    anyNA(test_116) || anyNA(test_top10)) {
+  stop("Missing predictor values were found.")
+}
+```
+
+Only the predictor count differs between the two training datasets.
+
+# Define identical cross-validation folds
+
+Both models are tuned using the same repeated five-fold cross-validation splits.
+
+```{r define-cross-validation}
+set.seed(123)
+
+cv_index <- caret::createMultiFolds(
+  y = train_116$group,
+  k = 5,
+  times = 10
+)
+
+ctrl_svm <- caret::trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 10,
+  index = cv_index,
+  classProbs = TRUE,
+  summaryFunction = caret::twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+Using identical folds makes the tuning comparison fairer.
+
+# Train the 116-DMR model
+
+The full radial SVM is retrained using the same procedure as the reduced model.
+
+```{r train-116-model}
+set.seed(123)
+
+model_svm_116_retrained <- caret::train(
+  group ~ .,
+  data = train_116,
+  method = "svmRadial",
+  metric = "ROC",
+  trControl = ctrl_svm,
+  tuneLength = 10,
+  preProcess = c("center", "scale")
+)
+
+print(model_svm_116_retrained$bestTune)
+```
+
+The best `sigma` and `C` are selected by repeated cross-validated ROC.
+
+# Train the Top10-DMR model
+
+The reduced radial SVM is trained with the same samples, folds, and tuning strategy.
+
+```{r train-top10-model}
+set.seed(123)
+
+model_svm_top10 <- caret::train(
+  group ~ .,
+  data = train_top10,
+  method = "svmRadial",
+  metric = "ROC",
+  trControl = ctrl_svm,
+  tuneLength = 10,
+  preProcess = c("center", "scale")
+)
+
+print(model_svm_top10$bestTune)
+```
+# Compare cross-validated training performance
+
+This chunk extracts the best repeated cross-validation performance from the two fitted SVM models.
+
+```{r compare-cross-validated-performance}
+cv_116 <- caret::getTrainPerf(
+  model_svm_116_retrained
+)
+
+cv_top10 <- caret::getTrainPerf(
+  model_svm_top10
+)
+
+cv_performance_comparison <- data.table(
+  Model = c(
+    "116-DMR radial SVM",
+    "Top10-DMR radial SVM"
+  ),
+  CV_ROC = c(
+    cv_116$TrainROC,
+    cv_top10$TrainROC
+  ),
+  CV_Sensitivity = c(
+    cv_116$TrainSens,
+    cv_top10$TrainSens
+  ),
+  CV_Specificity = c(
+    cv_116$TrainSpec,
+    cv_top10$TrainSpec
+  )
+)
+
+print(cv_performance_comparison)
+```
+
+Similar cross-validated ROC, sensitivity, and specificity values suggest that reducing the panel does not substantially weaken performance in the training cohort.
+
+# Define performance calculation
+
+This helper function avoids division-by-zero errors when calculating classification metrics.
+
+```{r define-safe-division}
+safe_div <- function(x, y) {
+  ifelse(
+    y == 0,
+    NA_real_,
+    x / y
+  )
+}
+```
+
+A metric is returned as `NA` only when its denominator is zero.
+
+This function calculates the confusion-matrix metrics and AUROC for one fitted model.
+
+```{r define-performance-function}
+calc_performance <- function(
+    true_group, pred_class, prob_tumor, model_name) {
+
+  true_group <- factor(
+    as.character(true_group), levels = c("Tumor", "Normal"))
+  pred_class <- factor(
+    as.character(pred_class), levels = c("Tumor", "Normal"))
+  cm <- table(
+    Predicted = pred_class, Reference = true_group)
+
+  TP <- cm["Tumor", "Tumor"]
+  TN <- cm["Normal", "Normal"]
+  FP <- cm["Tumor", "Normal"]
+  FN <- cm["Normal", "Tumor"]
+
+  sensitivity <- safe_div(TP, TP + FN)
+  specificity <- safe_div(TN, TN + FP)
+  ppv <- safe_div(TP, TP + FP)
+  npv <- safe_div(TN, TN + FN)
+  accuracy <- safe_div(TP + TN, sum(cm))
+  f1 <- safe_div(2 * ppv * sensitivity, ppv + sensitivity)
+
+  roc_obj <- pROC::roc(
+    response = true_group,
+    predictor = prob_tumor,
+    levels = c("Normal", "Tumor"),
+    direction = "<",
+    quiet = TRUE)
+
+  performance <- data.table(
+    Cohort = "TCGA full",
+    Model = model_name,
+    n_Normal = sum(true_group == "Normal"),
+    n_Tumor = sum(true_group == "Tumor"),
+    Accuracy = as.numeric(accuracy),
+    AUROC = as.numeric(pROC::auc(roc_obj)),
+    Sensitivity = as.numeric(sensitivity),
+    Specificity = as.numeric(specificity),
+    PPV = as.numeric(ppv),
+    NPV = as.numeric(npv),
+    F1 = as.numeric(f1),
+    Balanced_Accuracy = as.numeric(
+      (sensitivity + specificity) / 2))
+
+  list(
+    performance = performance,
+    roc = roc_obj,
+    confusion_matrix = cm)
+}
+```
+
+The returned ROC and confusion matrix are retained for paired model comparisons.
+
+# Define model prediction
+
+This function applies one fitted model to TCGA and returns summary metrics and sample-level predictions.
+
+```{r define-prediction-function}
+predict_and_score <- function(
+    model, feature_set, test_df, model_name) {
+
+  newdata <- test_df[
+    ,
+    feature_set,
+    drop = FALSE
+  ]
+
+  pred_class <- predict(
+    model,
+    newdata = newdata
+  )
+
+  prob_tumor <- predict(
+    model,
+    newdata = newdata,
+    type = "prob"
+  )[, "Tumor"]
+
+  score <- calc_performance(
+    true_group = test_df$group,
+    pred_class = pred_class,
+    prob_tumor = prob_tumor,
+    model_name = model_name
+  )
+
+  sample_ids <- rownames(test_df)
+  if (is.null(sample_ids)) {
+    sample_ids <- paste0(
+      "Sample_",
+      seq_len(nrow(test_df))
+    )
+  }
+
+  predictions <- data.table(
+    Sample = sample_ids,
+    True_group = as.character(test_df$group),
+    Predicted_group = as.character(pred_class),
+    Tumor_probability = as.numeric(prob_tumor)
+  )
+
+  list(
+    performance = score$performance,
+    predictions = predictions,
+    roc = score$roc,
+    confusion_matrix = score$confusion_matrix
+  )
+}
+```
+
+Both models will be evaluated using the same function and the same TCGA samples.
+
+# Evaluate the two models
+
+The retrained 116-DMR and Top10-DMR models are now applied to the TCGA full cohort.
+
+```{r evaluate-models}
+res_116_full <- predict_and_score(
+  model = model_svm_116_retrained,
+  feature_set = features_116,
+  test_df = test_df_full,
+  model_name = "116-DMR radial SVM"
+)
+
+res_top10_full <- predict_and_score(
+  model = model_svm_top10,
+  feature_set = features_top10,
+  test_df = test_df_full,
+  model_name = "Top10-DMR radial SVM"
+)
+
+performance_full_comparison <- rbindlist(
+  list(
+    res_116_full$performance,
+    res_top10_full$performance
+  )
+)
+
+print(performance_full_comparison)
+```
+
+The resulting table directly compares performance in the same TCGA cohort.
+
+# Compare metric differences
+
+This chunk calculates the difference between the Top10-DMR and 116-DMR model for each metric.
+
+```{r calculate-metric-differences}
+metric_cols <- c(
+  "Accuracy",
+  "AUROC",
+  "Sensitivity",
+  "Specificity",
+  "PPV",
+  "NPV",
+  "F1",
+  "Balanced_Accuracy"
+)
+
+values_116 <- unlist(
+  performance_full_comparison[
+    Model == "116-DMR radial SVM",
+    ..metric_cols
+  ],
+  use.names = FALSE
+)
+
+values_top10 <- unlist(
+  performance_full_comparison[
+    Model == "Top10-DMR radial SVM",
+    ..metric_cols
+  ],
+  use.names = FALSE
+)
+
+metric_difference_table <- data.table(
+  Metric = metric_cols,
+  Model_116 = as.numeric(values_116),
+  Model_Top10 = as.numeric(values_top10)
+)
+
+metric_difference_table[
+  ,
+  Top10_minus_116 :=
+    Model_Top10 - Model_116
+]
+
+print(metric_difference_table)
+```
+
+Differences close to zero indicate that the reduced panel retains similar predictive performance.
+
+# Compare AUROC values
+
+Because both ROC curves are based on the same TCGA samples, a paired DeLong test is used.
+
+```{r compare-auroc}
+delong_test <- tryCatch(
+  pROC::roc.test(
+    res_116_full$roc,
+    res_top10_full$roc,
+    paired = TRUE,
+    method = "delong"
+  ),
+  error = function(e) NULL
+)
+
+delong_p_value <- if (is.null(delong_test)) {
+  NA_real_
+} else {
+  delong_test$p.value
+}
+
+auc_comparison <- data.table(
+  AUROC_116 = as.numeric(
+    pROC::auc(res_116_full$roc)
+  ),
+  AUROC_Top10 = as.numeric(
+    pROC::auc(res_top10_full$roc)
+  ),
+  AUROC_difference =
+    as.numeric(pROC::auc(res_top10_full$roc)) -
+    as.numeric(pROC::auc(res_116_full$roc)),
+  DeLong_p_value = delong_p_value
+)
+
+print(auc_comparison)
+```
+
+A non-significant result means that the AUROC difference is not detected statistically in this cohort, but it does not establish formal equivalence.
+
+# Compare sample-level predictions
+
+This chunk aligns the two models' predictions for every TCGA sample.
+
+```{r prepare-paired-predictions}
+prediction_pair <- merge(
+  res_116_full$predictions[
+    ,
+    .(
+      Sample,
+      True_group,
+      Predicted_116 = Predicted_group,
+      Probability_116 = Tumor_probability
+    )
+  ],
+  res_top10_full$predictions[
+    ,
+    .(
+      Sample,
+      True_group,
+      Predicted_Top10 = Predicted_group,
+      Probability_Top10 = Tumor_probability
+    )
+  ],
+  by = c("Sample", "True_group")
+)
+
+if (nrow(prediction_pair) != nrow(test_df_full)) {
+  stop("The paired prediction table has an unexpected number of samples.")
+}
+```
+
+Every TCGA sample should have one prediction from each model.
+
+This chunk calculates class agreement and the correlation between predicted Tumor probabilities.
+
+```{r assess-prediction-agreement}
+prediction_pair[
+  ,
+  `:=`(
+    Correct_116 =
+      Predicted_116 == True_group,
+    Correct_Top10 =
+      Predicted_Top10 == True_group,
+    Same_prediction =
+      Predicted_116 == Predicted_Top10
+  )
+]
+
+prediction_agreement <- data.table(
+  Class_agreement = mean(
+    prediction_pair$Same_prediction
+  ),
+  Probability_correlation = cor(
+    prediction_pair$Probability_116,
+    prediction_pair$Probability_Top10,
+    method = "spearman"
+  )
+)
+
+print(prediction_agreement)
+```
+
+High class agreement and probability correlation indicate that the Top10 model behaves similarly to the full model.
+
+# Compare classification errors
+
+McNemar's test compares paired correct and incorrect classifications from the two models.
+
+```{r compare-classification-errors}
+mcnemar_table <- table(
+  Model_116_correct =
+    prediction_pair$Correct_116,
+  Model_Top10_correct =
+    prediction_pair$Correct_Top10
+)
+
+mcnemar_result <- tryCatch(
+  stats::mcnemar.test(mcnemar_table),
+  error = function(e) NULL
+)
+
+mcnemar_p_value <- if (is.null(mcnemar_result)) {
+  NA_real_
+} else {
+  mcnemar_result$p.value
+}
+
+mcnemar_summary <- data.table(
+  McNemar_p_value = mcnemar_p_value
+)
+
+print(mcnemar_table)
+print(mcnemar_summary)
+```
+
+This test assesses whether one model makes significantly more classification errors than the other on the same samples.
+
+# Export performance results
+
+The full-precision and rounded performance tables are saved below.
+
+```{r export-performance-tables}
+performance_rounded <- copy(
+  performance_full_comparison
+)
+
+performance_rounded[
+  ,
+  (metric_cols) := lapply(
+    .SD,
+    round,
+    digits = 3
+  ),
+  .SDcols = metric_cols
+]
+
+fwrite(
+  performance_full_comparison,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_performance.csv"
+  )
+)
+
+fwrite(
+  performance_rounded,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_performance_rounded.csv"
+  )
+)
+```
+
+The rounded table is suitable for presentation, while the full-precision table should be retained for analysis.
+
+This chunk saves the metric differences and paired statistical comparisons.
+
+```{r export-comparison-tables}
+fwrite(
+  cv_performance_comparison,
+  file.path(
+    outdir,
+    "GSE101764_CV_top10_vs_116_performance.csv"
+  )
+)
+
+fwrite(
+  metric_difference_table,
+  file.path(
+    outdir,
+    "TCGA_full_top10_minus_116_metric_differences.csv"
+  )
+)
+
+fwrite(
+  auc_comparison,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_AUROC_comparison.csv"
+  )
+)
+
+fwrite(
+  mcnemar_summary,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_McNemar_test.csv"
+  )
+)
+```
+
+These outputs quantify the reduction in performance and the paired statistical comparisons.
+
+This chunk saves the sample-level paired predictions and agreement summary.
+
+```{r export-prediction-tables}
+fwrite(
+  prediction_pair,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_paired_predictions.csv"
+  )
+)
+
+fwrite(
+  prediction_agreement,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_prediction_agreement.csv"
+  )
+)
+```
+
+The paired table identifies samples for which the two models disagree.
+
+# Plot performance metrics
+
+The main performance metrics are converted to long format for plotting.
+
+```{r prepare-performance-plot}
+plot_metrics <- c(
+  "Accuracy",
+  "AUROC",
+  "F1",
+  "PPV",
+  "Sensitivity",
+  "Specificity",
+  "Balanced_Accuracy"
+)
+
+performance_long <- melt(
+  performance_full_comparison,
+  id.vars = c("Cohort", "Model"),
+  measure.vars = plot_metrics,
+  variable.name = "Metric",
+  value.name = "Value"
+)
+```
+
+Each metric will be displayed side by side for the two models.
+
+```{r build-performance-plot}
+p_performance_full <- ggplot(
+  performance_long,
+  aes(
+    x = Metric,
+    y = Value,
+    fill = Model
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65
+  ) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.35,
+    size = 3.4
+  ) +
+  coord_cartesian(ylim = c(0, 1.08)) +
+  labs(
+    title = "TCGA full-cohort performance comparison",
+    subtitle = "116-DMR versus Top10-DMR radial SVM",
+    x = NULL,
+    y = "Metric value",
+    fill = "Model"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.x = element_text(
+      angle = 30,
+      hjust = 1
+    ),
+    legend.position = "top"
+  )
+```
+
+Similar bar heights indicate that the reduced panel retains performance close to the full panel.
+
+```{r save-performance-plot}
+print(p_performance_full)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_performance_barplot.png"
+  ),
+  plot = p_performance_full,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_performance_barplot.pdf"
+  ),
+  plot = p_performance_full,
+  width = 10,
+  height = 6
+)
+```
+
+The comparison plot is saved in both PNG and PDF formats.
+
+# Plot ROC curves
+
+The two ROC curves are converted into one plotting table.
+
+```{r prepare-roc-plot}
+roc_plot_df <- rbindlist(
+  list(
+    data.table(
+      False_positive_rate =
+        1 - res_116_full$roc$specificities,
+      Sensitivity =
+        res_116_full$roc$sensitivities,
+      Model = "116-DMR radial SVM"
+    ),
+    data.table(
+      False_positive_rate =
+        1 - res_top10_full$roc$specificities,
+      Sensitivity =
+        res_top10_full$roc$sensitivities,
+      Model = "Top10-DMR radial SVM"
+    )
+  )
+)
+```
+
+The two models can now be compared across all classification thresholds.
+```{r build-roc-plot}
+roc_plot_df$Model <- factor(
+  roc_plot_df$Model,
+  levels = c(
+    "116-DMR radial SVM",
+    "Top10-DMR radial SVM"
+  )
+)
+
+p_roc_comparison <- ggplot(
+  roc_plot_df,
+  aes(
+    x = False_positive_rate,
+    y = Sensitivity,
+    color = Model,
+    linetype = Model,
+    linewidth = Model
+  )
+) +
+  geom_step(
+    direction = "vh",
+    alpha = 0.9
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "grey60",
+    linewidth = 0.7
+  ) +
+  scale_color_manual(
+    values = c(
+      "116-DMR radial SVM" = "#F8766D",
+      "Top10-DMR radial SVM" = "#00BFC4"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "116-DMR radial SVM" = "solid",
+      "Top10-DMR radial SVM" = "longdash"
+    )
+  ) +
+  scale_linewidth_manual(
+    values = c(
+      "116-DMR radial SVM" = 1.8,
+      "Top10-DMR radial SVM" = 1.0
+    )
+  ) +
+  coord_equal() +
+  labs(
+    title = "TCGA full-cohort ROC comparison",
+    subtitle = paste0(
+      "Paired DeLong p = ",
+      signif(delong_p_value, 3)
+    ),
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "Model",
+    linetype = "Model"
+  ) +
+  guides(
+    linewidth = "none"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    legend.position = "top",
+    legend.title = element_text(
+      face = "bold"
+    )
+  )
+```
+
+Substantial overlap between the curves indicates similar discrimination.
+
+```{r save-roc-plot}
+print(p_roc_comparison)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_ROC_comparison.png"
+  ),
+  plot = p_roc_comparison,
+  width = 7,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_ROC_comparison.pdf"
+  ),
+  plot = p_roc_comparison,
+  width = 7,
+  height = 7
+)
+```
+
+The ROC comparison is saved in both PNG and PDF formats.
+## Assess and visualise sample-level prediction agreement
+```{r}
+# Assess and visualise sample-level prediction agreement
+
+## Confirm that the paired prediction table is complete.
+stopifnot(
+  nrow(prediction_pair) == nrow(test_df_full),
+  !anyNA(prediction_pair$Predicted_116),
+  !anyNA(prediction_pair$Predicted_Top10),
+  !anyNA(prediction_pair$Probability_116),
+  !anyNA(prediction_pair$Probability_Top10)
+)
+
+## Use identical factor levels for the two model predictions.
+pred_116_factor <- factor(
+  prediction_pair$Predicted_116,
+  levels = c("Tumor", "Normal")
+)
+
+pred_top10_factor <- factor(
+  prediction_pair$Predicted_Top10,
+  levels = c("Tumor", "Normal")
+)
+```
+## Calculate the proportion of samples receiving the same class prediction.
+```{r}
+class_agreement <- mean(
+  pred_116_factor == pred_top10_factor
+)
+
+## Calculate Cohen's kappa between the two models.
+## Here, the 116-DMR prediction is treated as the reference prediction,
+## not as the biological ground truth.
+prediction_kappa_cm <- caret::confusionMatrix(
+  data = pred_top10_factor,
+  reference = pred_116_factor
+)
+
+cohen_kappa <- unname(
+  prediction_kappa_cm$overall["Kappa"]
+)
+
+## Calculate the Spearman correlation between predicted
+## Tumor probabilities from the two models.
+probability_correlation <- cor(
+  prediction_pair$Probability_116,
+  prediction_pair$Probability_Top10,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+## Calculate the average absolute difference in predicted probability.
+mean_absolute_probability_difference <- mean(
+  abs(
+    prediction_pair$Probability_116 -
+      prediction_pair$Probability_Top10
+  ),
+  na.rm = TRUE
+)
+
+## Build the complete agreement summary.
+prediction_agreement <- data.table(
+  Class_agreement = class_agreement,
+  Cohen_kappa = cohen_kappa,
+  Probability_correlation = probability_correlation,
+  Mean_absolute_probability_difference =
+    mean_absolute_probability_difference
+)
+
+cat("\nSample-level prediction agreement:\n")
+print(prediction_agreement)
+
+cat("\nPrediction agreement confusion matrix:\n")
+print(prediction_kappa_cm$table)
+```
+
+## Build a model-to-model prediction agreement table.
+```{r}
+## Build a model-to-model prediction agreement table.
+prediction_agreement_matrix <- table(
+  Prediction_116 = pred_116_factor,
+  Prediction_Top10 = pred_top10_factor
+)
+
+agreement_heatmap_df <- as.data.table(
+  as.data.frame(prediction_agreement_matrix)
+)
+
+setnames(
+  agreement_heatmap_df,
+  c(
+    "Prediction_116",
+    "Prediction_Top10",
+    "Count"
+  )
+)
+
+agreement_heatmap_df[
+  ,
+  Percent := Count / sum(Count)
+]
+
+print(agreement_heatmap_df)
+```
+## plot showing class agreement,Cohen’s kappa and predicted probability correlation
+```{r}
+## Prepare agreement metrics for plotting.
+agreement_metric_plot_df <- data.table(
+  Metric = factor(
+    c(
+      "Class agreement",
+      "Cohen's kappa",
+      "Probability correlation"
+    ),
+    levels = c(
+      "Class agreement",
+      "Cohen's kappa",
+      "Probability correlation"
+    )
+  ),
+  Value = c(
+    class_agreement,
+    cohen_kappa,
+    probability_correlation
+  )
+)
+
+p_agreement_summary <- ggplot(
+  agreement_metric_plot_df,
+  aes(
+    x = Metric,
+    y = Value
+  )
+) +
+  geom_col(
+    width = 0.65,
+    fill = "grey50"
+  ) +
+  geom_text(
+    aes(
+      label = sprintf(
+        "%.3f",
+        Value
+      )
+    ),
+    vjust = -0.4,
+    size = 4
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1.08)
+  ) +
+  labs(
+    title = "Agreement between the 116-DMR and Top10-DMR models",
+    subtitle = paste0(
+      "Mean absolute probability difference = ",
+      sprintf(
+        "%.3f",
+        mean_absolute_probability_difference
+      )
+    ),
+    x = NULL,
+    y = "Agreement value"
+  ) +
+  theme_bw(
+    base_size = 11
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    axis.text.x = element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    panel.grid.major.x = element_blank()
+  )
+
+print(p_agreement_summary)
+```
+
+## Label whether the two models produced the same class prediction.
+```{r}
+## Label whether the two models produced the same class prediction.
+prediction_pair[
+  ,
+  Prediction_agreement_status := factor(
+    ifelse(
+      Same_prediction,
+      "Same predicted class",
+      "Different predicted class"
+    ),
+    levels = c(
+      "Same predicted class",
+      "Different predicted class"
+    )
+  )
+]
+
+p_probability_agreement <- ggplot(
+  prediction_pair,
+  aes(
+    x = Probability_116,
+    y = Probability_Top10,
+    color = True_group,
+    shape = Prediction_agreement_status
+  )
+) +
+  geom_point(
+    alpha = 0.70,
+    size = 2.2
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  coord_equal(
+    xlim = c(0, 1),
+    ylim = c(0, 1)
+  ) +
+  labs(
+    title = "Agreement in predicted Tumor probabilities",
+    subtitle = paste0(
+      "Spearman correlation = ",
+      sprintf(
+        "%.3f",
+        probability_correlation
+      ),
+      "; class agreement = ",
+      sprintf(
+        "%.1f%%",
+        100 * class_agreement
+      ),
+      "; Cohen's kappa = ",
+      sprintf(
+        "%.3f",
+        cohen_kappa
+      )
+    ),
+    x = "Tumor probability from 116-DMR model",
+    y = "Tumor probability from Top10-DMR model",
+    color = "True group",
+    shape = "Model agreement"
+  ) +
+  theme_bw(
+    base_size = 11
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 11
+    ),
+    axis.title = element_text(
+      size = 11
+    ),
+    axis.text = element_text(
+      size = 9
+    ),
+    legend.position = "top",
+    legend.box = "vertical"
+  )
+
+print(p_probability_agreement)
+```
+## heatmap
+```{r}
+p_class_agreement_heatmap <- ggplot(
+  agreement_heatmap_df,
+  aes(
+    x = Prediction_116,
+    y = Prediction_Top10,
+    fill = Count
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 1
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        Count,
+        "\n",
+        sprintf(
+          "%.1f%%",
+          100 * Percent
+        )
+      )
+    ),
+    size = 5
+  ) +
+  labs(
+    title = "Sample-level class agreement between the two models",
+    subtitle = paste0(
+      "Overall class agreement = ",
+      sprintf(
+        "%.1f%%",
+        100 * class_agreement
+      )
+    ),
+    x = "116-DMR model prediction",
+    y = "Top10-DMR model prediction",
+    fill = "Number of samples"
+  ) +
+  theme_bw(
+    base_size = 11
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    panel.grid = element_blank()
+  )
+
+print(p_class_agreement_heatmap)
+```
+## save plot results
+```{r}
+## Export the expanded agreement summary.
+fwrite(
+  prediction_agreement,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_prediction_agreement.csv"
+  )
+)
+
+## Export the prediction-agreement matrix.
+fwrite(
+  agreement_heatmap_df,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_prediction_agreement_matrix.csv"
+  )
+)
+
+## Export the three plotted agreement metrics.
+fwrite(
+  agreement_metric_plot_df,
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_agreement_metrics.csv"
+  )
+)
+```
+## save plots
+```{r}
+## Save the agreement summary plot.
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_agreement_summary.png"
+  ),
+  plot = p_agreement_summary,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_agreement_summary.pdf"
+  ),
+  plot = p_agreement_summary,
+  width = 8,
+  height = 6
+)
+
+## Save the probability agreement plot.
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_probability_agreement.png"
+  ),
+  plot = p_probability_agreement,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_probability_agreement.pdf"
+  ),
+  plot = p_probability_agreement,
+  width = 8,
+  height = 7
+)
+
+## Save the class-agreement heatmap.
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_class_agreement_heatmap.png"
+  ),
+  plot = p_class_agreement_heatmap,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_class_agreement_heatmap.pdf"
+  ),
+  plot = p_class_agreement_heatmap,
+  width = 7,
+  height = 6
+)
+```
+
+# Save analysis objects
+
+The fitted models and all comparison objects are saved for later review.
+
+```{r save-analysis-objects}
+save(
+  features_116,
+  features_top10,
+  cv_index,
+  model_svm_116_retrained,
+  model_svm_top10,
+  cv_performance_comparison,
+  performance_full_comparison,
+  metric_difference_table,
+  prediction_pair,
+  prediction_agreement,
+  prediction_kappa_cm,
+  prediction_agreement_matrix,
+  agreement_heatmap_df,
+  agreement_metric_plot_df,
+  auc_comparison,
+  delong_test,
+  mcnemar_table,
+  mcnemar_result,
+  p_performance_full,
+  p_roc_comparison,
+  p_agreement_summary,
+  p_probability_agreement,
+  p_class_agreement_heatmap,
+  file = file.path(
+    outdir,
+    "TCGA_full_top10_vs_116_radial_SVM_results.Rdata"
+  )
+)
+```
+
+This RData file allows the tables and figures to be reopened without retraining the models.
+
+# Session information
+
+The R version and package dependencies are listed below.
+
+```{r session-information}
+sessionInfo()
+```
