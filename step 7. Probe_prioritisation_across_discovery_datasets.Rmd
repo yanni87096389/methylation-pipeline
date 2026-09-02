@@ -1,0 +1,2208 @@
+---
+title: "Step 7. Probe prioritisation across discovery datasets"
+author: "YC"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    fig_width: 8
+    fig_height: 7
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# Overview
+
+This report prioritises representative CpG probes within the selected Top 20 DMRs.
+
+For each DMR, the analysis:
+
+1. uses the actual CpG probes contributing to the Step 1 DMRcate region;
+2. calculates a sample-level DMR mean beta value separately in GSE199057, GSE149282, and GSE119526;
+3. compares each CpG with the corresponding DMR mean across samples;
+4. calculates both the direct correlation with the full DMR mean and a leave-one-CpG-out correlation;
+5. combines the three dataset-specific results into a cross-dataset consensus ranking;
+6. selects one primary representative CpG and two backup CpGs per DMR.
+
+The direct full-mean correlation follows the simple approach proposed by Mark. The leave-one-CpG-out Spearman correlation is used as the primary ranking criterion because it avoids including the tested CpG in its own reference mean.
+
+**Interpretation note:** the selected probes represent the DMR methylation pattern across the three discovery cohorts. Final wet-lab selection should additionally consider assay design, surrounding sequence, SNPs, cross-reactivity, and other technical constraints.
+
+# 1. Initialise analysis
+
+This chunk clears the current environment and defines general display options.
+
+```{r initialise-analysis}
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+options(scipen = 20)
+```
+
+Starting from a clean environment reduces the risk of using objects left from an earlier analysis.
+
+# 2. Load packages
+
+The required packages provide data handling and visualisation functions.
+
+```{r load-packages}
+library(data.table)
+library(ggplot2)
+```
+
+Successful package loading confirms that the analysis environment is ready.
+
+# 3. Define input and output files
+
+The three processed discovery datasets provide sample-level CpG beta values. The Top 20 files define the selected DMRs and their actual DMRcate constituent probes.
+
+```{r define-input-files}
+gse199057_file <-
+  "step0.1-GSE199057_output.Rdata"
+
+gse149282_file <-
+  "step0.2-GSE149282_output.Rdata"
+
+gse119526_file <-
+  "step0.3-GSE119526_output.Rdata"
+
+top20_dmr_file <-
+  "Top20_priority_DMR_matched_to_original_DMRcate_nsim500.csv"
+
+dmr_probe_mapping_file <-
+  "Top20_priority_DMR_actual_EPIC_probes_used_by_DMRcate_nsim500.csv"
+
+probe_audit_file <-
+  "Top20_priority_DMR_probe_summary_and_audit_nsim500.csv"
+
+outdir <-
+  "step7.probe prioritisation"
+```
+
+Replace these names with full paths only when the files are stored in different directories.
+
+# 4. Check input files and create output directories
+
+The analysis stops before loading data if any required file is unavailable.
+
+```{r check-input-files}
+input_files <- c(
+  gse199057_file,
+  gse149282_file,
+  gse119526_file,
+  top20_dmr_file,
+  dmr_probe_mapping_file,
+  probe_audit_file
+)
+
+if (!all(file.exists(input_files))) {
+  stop(
+    "Missing input file(s): ",
+    paste(
+      input_files[!file.exists(input_files)],
+      collapse = ", "
+    )
+  )
+}
+
+if (!dir.exists(outdir)) {
+  dir.create(
+    outdir,
+    recursive = TRUE
+  )
+}
+
+scatter_plot_dir <- file.path(
+  outdir,
+  "selected_probe_scatterplots"
+)
+
+if (!dir.exists(scatter_plot_dir)) {
+  dir.create(
+    scatter_plot_dir,
+    recursive = TRUE
+  )
+}
+```
+
+Successful completion confirms that all inputs are present and the result directories are ready.
+
+# 5. Define the RData loading function
+
+This helper function loads `myLoad` into a temporary environment so that repeated object names do not overwrite one another.
+
+```{r define-load-myload-function}
+load_myload <- function(file) {
+
+  if (!file.exists(file)) {
+    stop(
+      "Input file does not exist: ",
+      file
+    )
+  }
+
+  temp_env <- new.env()
+
+  loaded_objects <- load(
+    file = file,
+    envir = temp_env
+  )
+
+  if (!"myLoad" %in% loaded_objects) {
+    stop(
+      "The file ",
+      file,
+      " does not contain an object named 'myLoad'."
+    )
+  }
+
+  temp_env$myLoad
+}
+```
+
+The function returns only the expected `myLoad` object from each processed dataset.
+
+# 6. Load the processed discovery datasets
+
+The three discovery datasets are loaded independently.
+
+```{r load-discovery-datasets}
+obj_199057 <- load_myload(
+  gse199057_file
+)
+
+obj_149282 <- load_myload(
+  gse149282_file
+)
+
+obj_119526 <- load_myload(
+  gse119526_file
+)
+```
+
+Each loaded object should contain a filtered beta matrix and its corresponding phenotype table.
+
+# 7. Extract beta matrices and phenotype data
+
+The original object names used in Step 1 are retained.
+
+```{r extract-beta-and-phenotype-data}
+g1 <- obj_199057$beta
+pd1 <- obj_199057$pd
+
+g2 <- obj_149282$beta
+pd2 <- obj_149282$pd
+
+g3 <- obj_119526$beta
+pd3 <- obj_119526$pd
+```
+
+`g1`, `g2`, and `g3` contain CpGs in rows and samples in columns. The corresponding `pd` objects contain sample annotations.
+
+# 8. Define a sample-alignment function
+
+This function verifies and restores exact correspondence between beta-matrix columns and phenotype rows.
+
+```{r define-alignment-function}
+align_beta_and_pd <- function(
+    beta,
+    pd,
+    dataset_name) {
+
+  beta <- as.matrix(beta)
+  storage.mode(beta) <- "numeric"
+  pd <- as.data.frame(pd)
+
+  if (!"group" %in% colnames(pd)) {
+    stop(
+      dataset_name,
+      ": column 'group' was not found in pd."
+    )
+  }
+
+  if ("ID" %in% colnames(pd)) {
+    if (!setequal(
+      colnames(beta),
+      as.character(pd$ID)
+    )) {
+      stop(
+        dataset_name,
+        ": beta columns and pd$ID do not contain the same samples."
+      )
+    }
+
+    pd <- pd[
+      match(
+        colnames(beta),
+        as.character(pd$ID)
+      ),
+      ,
+      drop = FALSE
+    ]
+
+    rownames(pd) <- as.character(
+      pd$ID
+    )
+  }
+
+  if (!identical(
+    colnames(beta),
+    rownames(pd)
+  )) {
+    stop(
+      dataset_name,
+      ": sample alignment failed."
+    )
+  }
+
+  pd$group <- factor(
+    as.character(pd$group),
+    levels = c(
+      "Normal",
+      "Tumor"
+    )
+  )
+
+  if (anyNA(pd$group)) {
+    stop(
+      dataset_name,
+      ": unexpected or missing group labels were found."
+    )
+  }
+
+  list(
+    beta = beta,
+    pd = pd
+  )
+}
+```
+
+The function also standardises the group order as Normal followed by Tumor.
+
+# 9. Align the three discovery datasets
+
+The alignment function is applied separately to each beta matrix and phenotype table.
+
+```{r align-discovery-datasets}
+aligned_199057 <- align_beta_and_pd(
+  g1,
+  pd1,
+  "GSE199057"
+)
+
+aligned_149282 <- align_beta_and_pd(
+  g2,
+  pd2,
+  "GSE149282"
+)
+
+aligned_119526 <- align_beta_and_pd(
+  g3,
+  pd3,
+  "GSE119526"
+)
+
+g1 <- aligned_199057$beta
+pd1 <- aligned_199057$pd
+
+g2 <- aligned_149282$beta
+pd2 <- aligned_149282$pd
+
+g3 <- aligned_119526$beta
+pd3 <- aligned_119526$pd
+```
+
+All three phenotype tables now follow the exact sample order of their corresponding beta matrices.
+
+# 10. Summarise the discovery datasets
+
+This table documents the CpG, sample, Normal, and Tumor counts available in each discovery dataset.
+
+```{r summarise-discovery-datasets}
+discovery_dataset_summary <- data.table(
+  Dataset = c(
+    "GSE199057",
+    "GSE149282",
+    "GSE119526"
+  ),
+  CpGs_before_common_filter = c(
+    nrow(g1),
+    nrow(g2),
+    nrow(g3)
+  ),
+  Samples = c(
+    ncol(g1),
+    ncol(g2),
+    ncol(g3)
+  ),
+  Normal = c(
+    sum(pd1$group == "Normal"),
+    sum(pd2$group == "Normal"),
+    sum(pd3$group == "Normal")
+  ),
+  Tumor = c(
+    sum(pd1$group == "Tumor"),
+    sum(pd2$group == "Tumor"),
+    sum(pd3$group == "Tumor")
+  )
+)
+
+print(
+  discovery_dataset_summary
+)
+```
+
+The group counts should be checked against the corrected phenotype assignments used in Step 1.
+
+# 11. Identify CpGs shared across all discovery datasets
+
+The common CpG universe is reconstructed exactly as in Step 1.
+
+```{r identify-common-cpgs}
+common_cpg <- Reduce(
+  intersect,
+  list(
+    rownames(g1),
+    rownames(g2),
+    rownames(g3)
+  )
+)
+
+cat(
+  "Number of CpG probes shared across all three datasets:",
+  length(common_cpg),
+  "\n"
+)
+
+if (length(common_cpg) == 0L) {
+  stop(
+    "No common CpG probes were found across the three datasets."
+  )
+}
+```
+
+A non-zero result confirms that the datasets share probes that can be compared consistently.
+
+# 12. Restrict beta matrices to common CpGs
+
+Using the same `common_cpg` vector places the CpGs in an identical order in all three matrices.
+
+```{r subset-to-common-cpgs}
+g1 <- g1[
+  common_cpg,
+  ,
+  drop = FALSE
+]
+
+g2 <- g2[
+  common_cpg,
+  ,
+  drop = FALSE
+]
+
+g3 <- g3[
+  common_cpg,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(g1),
+    rownames(g2)
+  ),
+  identical(
+    rownames(g1),
+    rownames(g3)
+  )
+)
+
+cat(
+  "All three matrices contain",
+  nrow(g1),
+  "common CpGs in the same order.\n"
+)
+```
+
+The resulting matrices use the same CpG universe as the discovery meta-analysis.
+
+# 13. Load Top 20 DMR and probe-mapping tables
+
+The Top 20 region table, actual DMRcate probe mapping, and existing probe audit are imported.
+
+```{r load-top20-input-tables}
+top20_dmrs_raw <- fread(
+  top20_dmr_file
+)
+
+dmr_probe_mapping_raw <- fread(
+  dmr_probe_mapping_file
+)
+
+probe_audit_raw <- fread(
+  probe_audit_file
+)
+
+cat("\nTop 20 DMR table columns:\n")
+print(names(top20_dmrs_raw))
+
+cat("\nDMR-probe mapping table columns:\n")
+print(names(dmr_probe_mapping_raw))
+
+cat("\nProbe audit table columns:\n")
+print(names(probe_audit_raw))
+```
+
+The printed column names provide an audit trail of the imported source-table structures.
+
+# 14. Define table-standardisation helpers
+
+These helpers identify common column-name variants without modifying the original imported tables.
+
+```{r define-table-standardisation-helpers}
+find_column <- function(
+    data,
+    candidates,
+    description,
+    required = TRUE) {
+
+  matched <- candidates[
+    candidates %in% names(data)
+  ]
+
+  if (length(matched) == 0) {
+    if (required) {
+      stop(
+        "Could not identify ",
+        description,
+        ". Available columns: ",
+        paste(
+          names(data),
+          collapse = ", "
+        )
+      )
+    }
+
+    return(NULL)
+  }
+
+  matched[1]
+}
+
+normalise_coordinate <- function(x) {
+  x <- as.character(x)
+  x <- gsub(
+    ",",
+    "",
+    x
+  )
+  gsub(
+    "\\s+",
+    "",
+    x
+  )
+}
+```
+
+Standardised working copies are constructed below, while the original tables are retained for auditing.
+
+# 15. Standardise the Top 20 DMR table
+
+This chunk identifies the current DMR identifier, stable coordinate, and priority-rank columns.
+
+```{r identify-top20-dmr-columns}
+top20_id_column <- find_column(
+  top20_dmrs_raw,
+  c(
+    "Current_DMR_ID",
+    "current_DMR_ID",
+    "DMR_ID",
+    "DMR"
+  ),
+  "the current DMR identifier"
+)
+
+top20_coordinate_column <- find_column(
+  top20_dmrs_raw,
+  c(
+    "coordinate_key",
+    "DMR_coordinate",
+    "discovery_coord",
+    "coord",
+    "DMR_id"
+  ),
+  "the DMR coordinate"
+)
+
+top20_rank_column <- find_column(
+  top20_dmrs_raw,
+  c(
+    "priority_rank",
+    "Priority_rank",
+    "Rank",
+    "rank"
+  ),
+  "the priority rank",
+  required = FALSE
+)
+```
+
+When no explicit rank column is present, the source-table row order is retained.
+
+```{r build-standard-top20-dmr-table}
+top20_dmrs <- data.table(
+  Current_DMR_ID = as.character(
+    top20_dmrs_raw[[
+      top20_id_column
+    ]]
+  ),
+  coordinate_key = normalise_coordinate(
+    top20_dmrs_raw[[
+      top20_coordinate_column
+    ]]
+  )
+)
+
+if (is.null(top20_rank_column)) {
+  top20_dmrs[
+    ,
+    priority_rank := seq_len(.N)
+  ]
+} else {
+  top20_dmrs[
+    ,
+    priority_rank := as.integer(
+      top20_dmrs_raw[[
+        top20_rank_column
+      ]]
+    )
+  ]
+}
+
+top20_dmrs <- unique(
+  top20_dmrs
+)
+
+setorder(
+  top20_dmrs,
+  priority_rank
+)
+
+top20_dmrs[
+  ,
+  DMR_order := seq_len(.N)
+]
+```
+
+The standardised working table uses stable names required by the subsequent analysis.
+
+# 16. Check the Top 20 DMR table
+
+The selected table must contain 20 unique DMR identifiers and 20 unique coordinates.
+
+```{r check-top20-dmr-table}
+if (nrow(top20_dmrs) != 20) {
+  stop(
+    "The standardised Top 20 table does not contain exactly 20 DMRs."
+  )
+}
+
+if (anyDuplicated(
+  top20_dmrs$Current_DMR_ID
+) > 0) {
+  stop(
+    "Duplicated Current_DMR_ID values were found."
+  )
+}
+
+if (anyDuplicated(
+  top20_dmrs$coordinate_key
+) > 0) {
+  stop(
+    "Duplicated coordinate_key values were found."
+  )
+}
+
+print(
+  top20_dmrs
+)
+```
+
+The printed table defines the DMR order used in all result tables and figures.
+
+# 17. Identify columns in the actual DMRcate probe mapping
+
+The CpG column is required. The mapping can be linked using either the stable coordinate or the current DMR identifier.
+
+```{r identify-probe-mapping-columns}
+mapping_cpg_column <- find_column(
+  dmr_probe_mapping_raw,
+  c(
+    "CpG",
+    "cpg",
+    "Probe",
+    "probe",
+    "Probe_ID",
+    "probe_id",
+    "CpG_ID",
+    "cpg_id"
+  ),
+  "the CpG probe identifier"
+)
+
+mapping_coordinate_column <- find_column(
+  dmr_probe_mapping_raw,
+  c(
+    "coordinate_key",
+    "DMR_coordinate",
+    "discovery_coord",
+    "coord",
+    "DMR_id"
+  ),
+  "the DMR coordinate",
+  required = FALSE
+)
+
+mapping_id_column <- find_column(
+  dmr_probe_mapping_raw,
+  c(
+    "Current_DMR_ID",
+    "current_DMR_ID",
+    "DMR_ID",
+    "DMR"
+  ),
+  "the DMR identifier",
+  required = FALSE
+)
+
+if (
+  is.null(mapping_coordinate_column) &&
+  is.null(mapping_id_column)
+) {
+  stop(
+    "The probe mapping must contain a DMR coordinate or identifier."
+  )
+}
+```
+
+A stable region link is required for every probe.
+
+# 18. Standardise the DMR–CpG mapping
+
+Coordinates are preferred because they remain stable when DMR display numbers change.
+
+```{r build-standard-probe-mapping}
+mapping_work <- data.table(
+  CpG = as.character(
+    dmr_probe_mapping_raw[[
+      mapping_cpg_column
+    ]]
+  )
+)
+
+if (!is.null(mapping_coordinate_column)) {
+  mapping_work[
+    ,
+    coordinate_key := normalise_coordinate(
+      dmr_probe_mapping_raw[[
+        mapping_coordinate_column
+      ]]
+    )
+  ]
+
+  top20_probe_mapping <- merge(
+    mapping_work,
+    top20_dmrs,
+    by = "coordinate_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+} else {
+  mapping_work[
+    ,
+    Current_DMR_ID := as.character(
+      dmr_probe_mapping_raw[[
+        mapping_id_column
+      ]]
+    )
+  ]
+
+  top20_probe_mapping <- merge(
+    mapping_work,
+    top20_dmrs,
+    by = "Current_DMR_ID",
+    all.x = TRUE,
+    sort = FALSE
+  )
+}
+```
+
+The resulting table assigns every actual DMRcate probe to one selected Top 20 DMR.
+
+# 19. Clean and validate the DMR–CpG mapping
+
+Blank probes, unmatched DMRs, and duplicated DMR–CpG pairs are checked before analysis.
+
+```{r clean-and-check-probe-mapping}
+top20_probe_mapping <- top20_probe_mapping[
+  !is.na(CpG) &
+    CpG != ""
+]
+
+if (anyNA(
+  top20_probe_mapping$Current_DMR_ID
+)) {
+  print(
+    top20_probe_mapping[
+      is.na(Current_DMR_ID)
+    ]
+  )
+
+  stop(
+    "Some mapping rows could not be linked to the Top 20 DMR table."
+  )
+}
+
+top20_probe_mapping <- unique(
+  top20_probe_mapping[
+    ,
+    .(
+      DMR_order,
+      priority_rank,
+      Current_DMR_ID,
+      coordinate_key,
+      CpG
+    )
+  ]
+)
+
+setorder(
+  top20_probe_mapping,
+  DMR_order,
+  CpG
+)
+
+if (uniqueN(
+  top20_probe_mapping$Current_DMR_ID
+) != 20) {
+  stop(
+    "The probe mapping does not cover all 20 DMRs."
+  )
+}
+```
+
+Only unique and valid DMR–CpG pairs are retained.
+
+# 20. Confirm that mapped probes belong to `common_cpg`
+
+The actual DMRcate probes should all be present in the common CpG universe used during discovery.
+
+```{r check-mapped-probes-against-common-cpgs}
+mapped_cpg <- unique(
+  top20_probe_mapping$CpG
+)
+
+missing_from_common_cpg <- setdiff(
+  mapped_cpg,
+  common_cpg
+)
+
+probe_common_cpg_check <- data.table(
+  Total_unique_mapped_CpGs =
+    length(mapped_cpg),
+  CpGs_present_in_common_set =
+    length(
+      intersect(
+        mapped_cpg,
+        common_cpg
+      )
+    ),
+  CpGs_missing_from_common_set =
+    length(
+      missing_from_common_cpg
+    )
+)
+
+print(
+  probe_common_cpg_check
+)
+
+if (length(
+  missing_from_common_cpg
+) > 0) {
+  print(
+    missing_from_common_cpg
+  )
+
+  stop(
+    "Some actual DMRcate probes are absent from common_cpg."
+  )
+}
+```
+
+The expected number of missing probes is zero.
+
+# 21. Summarise Top 20 DMR probe coverage
+
+The number of actual constituent CpGs is counted for every selected DMR.
+
+```{r summarise-top20-probe-coverage}
+top20_probe_mapping_summary <-
+  top20_probe_mapping[
+    ,
+    .(
+      n_actual_DMRcate_CpGs =
+        uniqueN(CpG)
+    ),
+    by = .(
+      DMR_order,
+      priority_rank,
+      Current_DMR_ID,
+      coordinate_key
+    )
+  ]
+
+setorder(
+  top20_probe_mapping_summary,
+  DMR_order
+)
+
+print(
+  top20_probe_mapping_summary
+)
+
+if (any(
+  top20_probe_mapping_summary$
+    n_actual_DMRcate_CpGs < 2
+)) {
+  stop(
+    "At least one DMR contains fewer than two mapped CpGs."
+  )
+}
+```
+
+At least two CpGs are required to calculate a leave-one-CpG-out DMR mean.
+
+# 22. Build discovery dataset lists
+
+The three beta matrices and phenotype tables are grouped into named lists for consistent processing.
+
+```{r build-discovery-data-lists}
+discovery_beta_list <- list(
+  GSE199057 = g1,
+  GSE149282 = g2,
+  GSE119526 = g3
+)
+
+discovery_pd_list <- list(
+  GSE199057 = pd1,
+  GSE149282 = pd2,
+  GSE119526 = pd3
+)
+
+stopifnot(
+  identical(
+    names(discovery_beta_list),
+    names(discovery_pd_list)
+  )
+)
+```
+
+Each discovery cohort will be analysed independently rather than combining samples across datasets.
+
+# 23. Define safe calculation functions
+
+These helpers return `NA` when a correlation or summary statistic cannot be calculated reliably.
+
+```{r define-safe-calculation-functions}
+safe_cor <- function(
+    x,
+    y,
+    method = "spearman") {
+
+  keep <- complete.cases(
+    x,
+    y
+  )
+
+  if (sum(keep) < 3) {
+    return(NA_real_)
+  }
+
+  x_keep <- x[keep]
+  y_keep <- y[keep]
+
+  sd_x <- stats::sd(x_keep)
+  sd_y <- stats::sd(y_keep)
+
+  if (
+    !is.finite(sd_x) ||
+    !is.finite(sd_y) ||
+    sd_x == 0 ||
+    sd_y == 0
+  ) {
+    return(NA_real_)
+  }
+
+  stats::cor(
+    x_keep,
+    y_keep,
+    method = method
+  )
+}
+
+safe_mean <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+
+  mean(x)
+}
+```
+
+Undefined correlations do not interrupt the complete analysis.
+
+```{r define-safe-summary-functions}
+safe_summary <- function(
+    x,
+    function_name) {
+
+  x <- x[is.finite(x)]
+
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+
+  switch(
+    function_name,
+    median = stats::median(x),
+    mean = base::mean(x),
+    minimum = base::min(x),
+    maximum = base::max(x),
+    sd = if (
+      length(x) >= 2
+    ) stats::sd(x) else NA_real_,
+    stop(
+      "Unknown summary function."
+    )
+  )
+}
+
+safe_all_positive <- function(x) {
+  x <- x[is.finite(x)]
+
+  if (length(x) == 0) {
+    return(NA)
+  }
+
+  all(x > 0)
+}
+```
+
+These functions are also used to build cross-dataset consensus statistics.
+
+# 24. Define the dataset-specific probe analysis
+
+For each DMR, this function calculates the full DMR mean, the leave-one-CpG-out mean, correlation statistics, beta differences, and sample-level supporting values.
+
+```{r define-dataset-probe-analysis-function}
+calculate_dataset_probe_results <- function(
+    beta,
+    pd,
+    dataset_name,
+    top20_dmrs,
+    top20_probe_mapping) {
+
+  probe_result_list <- list()
+  sample_result_list <- list()
+  dmr_mean_result_list <- list()
+
+  probe_index <- 1
+  sample_index <- 1
+  dmr_index <- 1
+
+  for (i in seq_len(nrow(top20_dmrs))) {
+
+    current_dmr <- top20_dmrs$Current_DMR_ID[i]
+
+    current_cpgs <- top20_probe_mapping[
+      Current_DMR_ID == current_dmr,
+      CpG
+    ]
+
+    current_cpgs <- intersect(
+      current_cpgs,
+      rownames(beta)
+    )
+
+    if (length(current_cpgs) < 2) {
+      stop(
+        dataset_name,
+        ": fewer than two CpGs were available for ",
+        current_dmr,
+        "."
+      )
+    }
+
+    beta_dmr <- beta[
+      current_cpgs,
+      ,
+      drop = FALSE
+    ]
+
+    dmr_mean_full <- colMeans(
+      beta_dmr,
+      na.rm = TRUE
+    )
+
+    dmr_mean_full[
+      is.nan(dmr_mean_full)
+    ] <- NA_real_
+
+    dmr_mean_result_list[[dmr_index]] <-
+      data.table(
+        Dataset = dataset_name,
+        DMR_order = top20_dmrs$DMR_order[i],
+        priority_rank = top20_dmrs$priority_rank[i],
+        Current_DMR_ID = current_dmr,
+        coordinate_key = top20_dmrs$coordinate_key[i],
+        Sample = colnames(beta_dmr),
+        Group = as.character(pd$group),
+        DMR_mean_beta = dmr_mean_full
+      )
+
+    dmr_index <- dmr_index + 1
+
+    for (j in seq_along(current_cpgs)) {
+
+      current_cpg <- current_cpgs[j]
+
+      probe_beta <- as.numeric(
+        beta_dmr[j, ]
+      )
+
+      dmr_mean_leave_one_out <- colMeans(
+        beta_dmr[
+          -j,
+          ,
+          drop = FALSE
+        ],
+        na.rm = TRUE
+      )
+
+      dmr_mean_leave_one_out[
+        is.nan(dmr_mean_leave_one_out)
+      ] <- NA_real_
+
+      normal_index <- pd$group == "Normal"
+      tumor_index <- pd$group == "Tumor"
+
+      mean_beta_normal <- safe_mean(
+        probe_beta[normal_index]
+      )
+
+      mean_beta_tumor <- safe_mean(
+        probe_beta[tumor_index]
+      )
+
+      dmr_mean_normal <- safe_mean(
+        dmr_mean_full[normal_index]
+      )
+
+      dmr_mean_tumor <- safe_mean(
+        dmr_mean_full[tumor_index]
+      )
+
+      cpg_delta_beta <-
+        mean_beta_tumor -
+        mean_beta_normal
+
+      dmr_delta_beta <-
+        dmr_mean_tumor -
+        dmr_mean_normal
+
+      delta_direction_consistent <- if (
+        is.finite(cpg_delta_beta) &&
+        is.finite(dmr_delta_beta)
+      ) {
+        sign(cpg_delta_beta) ==
+          sign(dmr_delta_beta)
+      } else {
+        NA
+      }
+
+      probe_result_list[[probe_index]] <-
+        data.table(
+          Dataset = dataset_name,
+          DMR_order = top20_dmrs$DMR_order[i],
+          priority_rank = top20_dmrs$priority_rank[i],
+          Current_DMR_ID = current_dmr,
+          coordinate_key = top20_dmrs$coordinate_key[i],
+          CpG = current_cpg,
+          nCpG_in_DMR = length(current_cpgs),
+          n_complete_all = sum(
+            complete.cases(
+              probe_beta,
+              dmr_mean_leave_one_out
+            )
+          ),
+          Spearman_full_DMR_mean = safe_cor(
+            probe_beta,
+            dmr_mean_full,
+            method = "spearman"
+          ),
+          Pearson_full_DMR_mean = safe_cor(
+            probe_beta,
+            dmr_mean_full,
+            method = "pearson"
+          ),
+          Spearman_leave_one_out = safe_cor(
+            probe_beta,
+            dmr_mean_leave_one_out,
+            method = "spearman"
+          ),
+          Pearson_leave_one_out = safe_cor(
+            probe_beta,
+            dmr_mean_leave_one_out,
+            method = "pearson"
+          ),
+          Spearman_leave_one_out_Normal = safe_cor(
+            probe_beta[normal_index],
+            dmr_mean_leave_one_out[normal_index],
+            method = "spearman"
+          ),
+          Spearman_leave_one_out_Tumor = safe_cor(
+            probe_beta[tumor_index],
+            dmr_mean_leave_one_out[tumor_index],
+            method = "spearman"
+          ),
+          Mean_absolute_difference_full_mean =
+            safe_mean(
+              abs(
+                probe_beta -
+                  dmr_mean_full
+              )
+            ),
+          Mean_beta_Normal = mean_beta_normal,
+          Mean_beta_Tumor = mean_beta_tumor,
+          CpG_deltaBeta = cpg_delta_beta,
+          DMR_mean_Normal = dmr_mean_normal,
+          DMR_mean_Tumor = dmr_mean_tumor,
+          DMR_deltaBeta = dmr_delta_beta,
+          Delta_direction_consistent =
+            delta_direction_consistent
+        )
+
+      sample_result_list[[sample_index]] <-
+        data.table(
+          Dataset = dataset_name,
+          DMR_order = top20_dmrs$DMR_order[i],
+          priority_rank = top20_dmrs$priority_rank[i],
+          Current_DMR_ID = current_dmr,
+          coordinate_key = top20_dmrs$coordinate_key[i],
+          CpG = current_cpg,
+          Sample = colnames(beta_dmr),
+          Group = as.character(pd$group),
+          Probe_beta = probe_beta,
+          DMR_mean_full = dmr_mean_full,
+          DMR_mean_leave_one_out =
+            dmr_mean_leave_one_out
+        )
+
+      probe_index <- probe_index + 1
+      sample_index <- sample_index + 1
+    }
+  }
+
+  list(
+    probe_results = rbindlist(
+      probe_result_list,
+      use.names = TRUE,
+      fill = TRUE
+    ),
+    sample_results = rbindlist(
+      sample_result_list,
+      use.names = TRUE,
+      fill = TRUE
+    ),
+    dmr_mean_results = rbindlist(
+      dmr_mean_result_list,
+      use.names = TRUE,
+      fill = TRUE
+    )
+  )
+}
+```
+
+The function returns one probe-level table, one sample-level table, and one DMR-mean table for each dataset.
+
+# 25. Run the analysis in all three discovery datasets
+
+The function is applied independently to each discovery cohort.
+
+```{r run-dataset-specific-analyses}
+dataset_analysis_list <- lapply(
+  names(discovery_beta_list),
+  function(dataset_name) {
+    calculate_dataset_probe_results(
+      beta =
+        discovery_beta_list[[
+          dataset_name
+        ]],
+      pd =
+        discovery_pd_list[[
+          dataset_name
+        ]],
+      dataset_name =
+        dataset_name,
+      top20_dmrs =
+        top20_dmrs,
+      top20_probe_mapping =
+        top20_probe_mapping
+    )
+  }
+)
+
+names(dataset_analysis_list) <-
+  names(discovery_beta_list)
+```
+
+Samples are not directly combined across cohorts, preventing dataset-level differences from driving the correlations.
+
+# 26. Combine dataset-specific results
+
+The three sets of probe statistics and sample-level values are combined into long-format tables.
+
+```{r combine-dataset-specific-results}
+dataset_probe_results <- rbindlist(
+  lapply(
+    dataset_analysis_list,
+    function(x) {
+      x$probe_results
+    }
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+sample_level_probe_results <- rbindlist(
+  lapply(
+    dataset_analysis_list,
+    function(x) {
+      x$sample_results
+    }
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+dmr_sample_mean_beta <- rbindlist(
+  lapply(
+    dataset_analysis_list,
+    function(x) {
+      x$dmr_mean_results
+    }
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+print(
+  dim(
+    dataset_probe_results
+  )
+)
+```
+
+`dataset_probe_results` contains one row per DMR–CpG–dataset combination.
+
+# 27. Rank probes within each dataset
+
+Dataset-specific ranks describe how each CpG performs relative to the other probes in the same DMR and cohort.
+
+```{r rank-probes-within-datasets}
+dataset_probe_results <-
+  dataset_probe_results[
+    order(
+      Dataset,
+      DMR_order,
+      -Spearman_leave_one_out,
+      -Pearson_leave_one_out,
+      Mean_absolute_difference_full_mean,
+      CpG,
+      na.last = TRUE
+    )
+  ]
+
+dataset_probe_results[
+  ,
+  Dataset_representative_rank :=
+    seq_len(.N),
+  by = .(
+    Dataset,
+    Current_DMR_ID
+  )
+]
+
+print(
+  dataset_probe_results[
+    Dataset_representative_rank <= 3
+  ]
+)
+```
+
+These ranks are supporting information; final selection is based on consistency across all three cohorts.
+
+# 28. Build the cross-dataset consensus table
+
+For every DMR–CpG pair, correlations and ranks are summarised across the three discovery datasets.
+
+```{r calculate-consensus-statistics}
+consensus_probe_results <-
+  dataset_probe_results[
+    ,
+    .(
+      n_datasets_available = sum(
+        is.finite(
+          Spearman_leave_one_out
+        )
+      ),
+      Median_Spearman_leave_one_out =
+        safe_summary(
+          Spearman_leave_one_out,
+          "median"
+        ),
+      Mean_Spearman_leave_one_out =
+        safe_summary(
+          Spearman_leave_one_out,
+          "mean"
+        ),
+      Minimum_Spearman_leave_one_out =
+        safe_summary(
+          Spearman_leave_one_out,
+          "minimum"
+        ),
+      Maximum_Spearman_leave_one_out =
+        safe_summary(
+          Spearman_leave_one_out,
+          "maximum"
+        ),
+      SD_Spearman_leave_one_out =
+        safe_summary(
+          Spearman_leave_one_out,
+          "sd"
+        ),
+      Median_Pearson_leave_one_out =
+        safe_summary(
+          Pearson_leave_one_out,
+          "median"
+        ),
+      Median_Spearman_full_DMR_mean =
+        safe_summary(
+          Spearman_full_DMR_mean,
+          "median"
+        ),
+      Median_absolute_difference_full_mean =
+        safe_summary(
+          Mean_absolute_difference_full_mean,
+          "median"
+        ),
+      Median_CpG_deltaBeta =
+        safe_summary(
+          CpG_deltaBeta,
+          "median"
+        ),
+      Median_DMR_deltaBeta =
+        safe_summary(
+          DMR_deltaBeta,
+          "median"
+        ),
+      All_correlations_positive =
+        safe_all_positive(
+          Spearman_leave_one_out
+        ),
+      Delta_direction_consistent_datasets =
+        sum(
+          Delta_direction_consistent,
+          na.rm = TRUE
+        ),
+      Median_dataset_rank =
+        safe_summary(
+          Dataset_representative_rank,
+          "median"
+        ),
+      Mean_dataset_rank =
+        safe_summary(
+          Dataset_representative_rank,
+          "mean"
+        ),
+      Top1_in_n_datasets =
+        sum(
+          Dataset_representative_rank == 1,
+          na.rm = TRUE
+        )
+    ),
+    by = .(
+      DMR_order,
+      priority_rank,
+      Current_DMR_ID,
+      coordinate_key,
+      CpG,
+      nCpG_in_DMR
+    )
+  ]
+```
+
+The median correlation represents typical performance, while the minimum and standard deviation describe cross-dataset consistency.
+
+# 29. Rank probes by cross-dataset consensus
+
+The ranking prioritises complete, consistently positive, strongly correlated, and stable probes.
+
+```{r rank-probes-by-consensus}
+consensus_probe_results[
+  ,
+  All_correlations_positive_score :=
+    as.integer(
+      All_correlations_positive
+    )
+]
+
+consensus_probe_results <-
+  consensus_probe_results[
+    order(
+      DMR_order,
+      -n_datasets_available,
+      -All_correlations_positive_score,
+      -Median_Spearman_leave_one_out,
+      -Minimum_Spearman_leave_one_out,
+      SD_Spearman_leave_one_out,
+      Median_absolute_difference_full_mean,
+      CpG,
+      na.last = TRUE
+    )
+  ]
+
+consensus_probe_results[
+  ,
+  Consensus_representative_rank :=
+    seq_len(.N),
+  by = Current_DMR_ID
+]
+```
+
+Rank 1 identifies the CpG that most consistently follows its DMR methylation pattern across discovery cohorts.
+
+# 30. Select primary and backup probes
+
+One primary representative CpG and up to two backup CpGs are retained for each Top 20 DMR.
+
+```{r select-primary-and-backup-probes}
+selected_probes <- copy(
+  consensus_probe_results[
+    Consensus_representative_rank == 1
+  ]
+)
+
+top3_representative_probes <- copy(
+  consensus_probe_results[
+    Consensus_representative_rank <= 3
+  ]
+)
+
+setorder(
+  selected_probes,
+  DMR_order
+)
+
+setorder(
+  top3_representative_probes,
+  DMR_order,
+  Consensus_representative_rank
+)
+
+if (nrow(selected_probes) != 20) {
+  stop(
+    "The final rank-1 table does not contain exactly 20 probes."
+  )
+}
+
+print(
+  selected_probes[
+    ,
+    .(
+      priority_rank,
+      Current_DMR_ID,
+      coordinate_key,
+      CpG,
+      Median_Spearman_leave_one_out,
+      Minimum_Spearman_leave_one_out,
+      SD_Spearman_leave_one_out,
+      All_correlations_positive,
+      Median_dataset_rank,
+      Top1_in_n_datasets,
+      Median_CpG_deltaBeta,
+      Median_DMR_deltaBeta
+    )
+  ]
+)
+```
+
+The Top 3 table provides alternatives when the highest-ranked CpG is unsuitable for assay design.
+
+# 31. Build the selected-probe dataset check
+
+This table shows the selected CpG's performance separately in each discovery dataset.
+
+```{r build-selected-probe-dataset-check}
+selected_probe_dataset_check <- merge(
+  dataset_probe_results,
+  selected_probes[
+    ,
+    .(
+      Current_DMR_ID,
+      CpG,
+      Consensus_representative_rank
+    )
+  ],
+  by = c(
+    "Current_DMR_ID",
+    "CpG"
+  ),
+  all = FALSE
+)
+
+setorder(
+  selected_probe_dataset_check,
+  DMR_order,
+  Dataset
+)
+
+print(
+  selected_probe_dataset_check[
+    ,
+    .(
+      Dataset,
+      priority_rank,
+      Current_DMR_ID,
+      CpG,
+      Spearman_leave_one_out,
+      Pearson_leave_one_out,
+      Spearman_full_DMR_mean,
+      Spearman_leave_one_out_Normal,
+      Spearman_leave_one_out_Tumor,
+      CpG_deltaBeta,
+      DMR_deltaBeta,
+      Delta_direction_consistent,
+      Dataset_representative_rank
+    )
+  ]
+)
+```
+
+This table should be reviewed before a probe is accepted based only on its consensus summary.
+
+# 32. Prepare sample-level data for selected probes
+
+Only the rank-1 CpG from each DMR is retained for final scatterplots.
+
+```{r prepare-selected-probe-sample-data}
+selected_probe_sample_results <- merge(
+  sample_level_probe_results,
+  selected_probes[
+    ,
+    .(
+      Current_DMR_ID,
+      CpG,
+      Consensus_representative_rank
+    )
+  ],
+  by = c(
+    "Current_DMR_ID",
+    "CpG"
+  ),
+  all = FALSE
+)
+
+selected_probe_sample_results[
+  ,
+  DMR_label := paste0(
+    "Rank ",
+    priority_rank,
+    ": ",
+    Current_DMR_ID,
+    "\n",
+    coordinate_key,
+    "\n",
+    CpG
+  )
+]
+
+print(
+  dim(
+    selected_probe_sample_results
+  )
+)
+```
+
+Each selected DMR contributes one CpG profile per sample in each discovery dataset.
+
+# 33. Build the consensus-correlation plot
+
+The selected CpG's median correlation is shown together with its minimum-to-maximum range across datasets.
+
+```{r prepare-consensus-correlation-plot}
+selected_probes[
+  ,
+  DMR_label := paste0(
+    "Rank ",
+    priority_rank,
+    ": ",
+    Current_DMR_ID,
+    "\n",
+    CpG
+  )
+]
+
+selected_probes[
+  ,
+  DMR_label := factor(
+    DMR_label,
+    levels = rev(
+      DMR_label
+    )
+  )
+]
+```
+
+The factor order places the highest-priority DMR at the top.
+
+```{r build-consensus-correlation-plot}
+p_consensus_correlation <- ggplot(
+  selected_probes,
+  aes(
+    y = DMR_label
+  )
+) +
+  geom_segment(
+    aes(
+      x = Minimum_Spearman_leave_one_out,
+      xend = Maximum_Spearman_leave_one_out,
+      yend = DMR_label
+    ),
+    linewidth = 0.7
+  ) +
+  geom_point(
+    aes(
+      x = Median_Spearman_leave_one_out
+    ),
+    size = 3
+  ) +
+  geom_text(
+    aes(
+      x = Median_Spearman_leave_one_out,
+      label = sprintf(
+        "%.3f",
+        Median_Spearman_leave_one_out
+      )
+    ),
+    hjust = -0.25,
+    size = 3
+  ) +
+  coord_cartesian(
+    xlim = c(
+      min(
+        0,
+        selected_probes$
+          Minimum_Spearman_leave_one_out,
+        na.rm = TRUE
+      ),
+      1.08
+    )
+  ) +
+  labs(
+    title = "Representative CpG selected for each Top 20 DMR",
+    subtitle = "Point: median leave-one-out Spearman correlation; line: dataset range",
+    x = "Spearman correlation",
+    y = "DMR and selected CpG"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    panel.grid.major.y =
+      element_blank()
+  )
+
+print(
+  p_consensus_correlation
+)
+```
+
+A high median and a narrow, consistently positive range support stable probe representativeness.
+
+# 34. Build the selected-probe heatmap
+
+The dataset-specific leave-one-out correlations are displayed for every selected probe.
+
+```{r prepare-selected-probe-heatmap}
+selected_probe_heatmap_df <-
+  selected_probe_dataset_check[
+    ,
+    .(
+      Dataset,
+      priority_rank,
+      Current_DMR_ID,
+      CpG,
+      Spearman_leave_one_out
+    )
+  ]
+
+selected_probe_heatmap_df[
+  ,
+  DMR_label := paste0(
+    "Rank ",
+    priority_rank,
+    ": ",
+    Current_DMR_ID,
+    "\n",
+    CpG
+  )
+]
+
+selected_probe_heatmap_df[
+  ,
+  DMR_label := factor(
+    DMR_label,
+    levels = rev(
+      as.character(
+        selected_probes$DMR_label
+      )
+    )
+  )
+]
+```
+
+Each row represents one selected CpG and each column represents one discovery dataset.
+
+```{r build-selected-probe-heatmap}
+p_selected_probe_heatmap <- ggplot(
+  selected_probe_heatmap_df,
+  aes(
+    x = Dataset,
+    y = DMR_label,
+    fill = Spearman_leave_one_out
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.6
+  ) +
+  geom_text(
+    aes(
+      label = sprintf(
+        "%.2f",
+        Spearman_leave_one_out
+      )
+    ),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    midpoint = 0,
+    limits = c(-1, 1),
+    na.value = "grey85"
+  ) +
+  labs(
+    title = "Dataset-specific agreement of selected CpGs",
+    subtitle = "Leave-one-CpG-out Spearman correlation",
+    x = "Discovery dataset",
+    y = "DMR and selected CpG",
+    fill = "Spearman\ncorrelation"
+  ) +
+  theme_bw(
+    base_size = 12
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    panel.grid = element_blank()
+  )
+
+print(
+  p_selected_probe_heatmap
+)
+```
+
+Consistently high values across all three datasets indicate robust cross-cohort representativeness.
+
+# 35. Define the selected-probe scatterplot function
+
+One figure is generated per DMR, with separate panels for the three discovery datasets.
+
+```{r define-selected-probe-scatterplot-function}
+build_selected_probe_scatterplot <- function(
+    plot_data,
+    dmr_id) {
+
+  current_data <- plot_data[
+    Current_DMR_ID == dmr_id
+  ]
+
+  selected_cpg <- unique(
+    current_data$CpG
+  )
+
+  ggplot(
+    current_data,
+    aes(
+      x = DMR_mean_leave_one_out,
+      y = Probe_beta,
+      color = Group
+    )
+  ) +
+    geom_point(
+      alpha = 0.70,
+      size = 1.8
+    ) +
+    geom_smooth(
+      method = "lm",
+      formula = y ~ x,
+      se = FALSE,
+      linewidth = 0.7
+    ) +
+    facet_wrap(
+      ~ Dataset,
+      scales = "free"
+    ) +
+    labs(
+      title = paste0(
+        dmr_id,
+        ": ",
+        selected_cpg
+      ),
+      subtitle = "Selected CpG versus the mean beta of the remaining CpGs",
+      x = "Leave-one-CpG-out DMR mean beta",
+      y = "Selected CpG beta value",
+      color = "Group"
+    ) +
+    theme_bw(
+      base_size = 12
+    ) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold"
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5
+      ),
+      legend.position = "top"
+    )
+}
+```
+
+A tight increasing relationship in all three panels supports selection of the CpG as a region-level representative.
+
+# 36. Save one scatterplot per Top 20 DMR
+
+The twenty DMR-specific scatterplots are written to a dedicated subdirectory.
+
+```{r save-selected-probe-scatterplots}
+for (current_dmr in
+     selected_probes$Current_DMR_ID) {
+
+  current_plot <-
+    build_selected_probe_scatterplot(
+      selected_probe_sample_results,
+      current_dmr
+    )
+
+  safe_dmr_name <- gsub(
+    "[^A-Za-z0-9_-]",
+    "_",
+    current_dmr
+  )
+
+  ggsave(
+    file.path(
+      scatter_plot_dir,
+      paste0(
+        safe_dmr_name,
+        "_selected_probe_scatter.png"
+      )
+    ),
+    plot = current_plot,
+    width = 10,
+    height = 4,
+    dpi = 300
+  )
+
+  ggsave(
+    file.path(
+      scatter_plot_dir,
+      paste0(
+        safe_dmr_name,
+        "_selected_probe_scatter.pdf"
+      )
+    ),
+    plot = current_plot,
+    width = 10,
+    height = 4
+  )
+}
+```
+
+These plots allow the final selected probe to be inspected separately in each discovery cohort.
+
+# 37. Export input and mapping audits
+
+The standardised Top 20 table, actual DMRcate probe mapping, and coverage checks are saved.
+
+```{r export-input-and-mapping-audits}
+fwrite(
+  discovery_dataset_summary,
+  file.path(
+    outdir,
+    "discovery_dataset_summary.csv"
+  )
+)
+
+fwrite(
+  top20_dmrs,
+  file.path(
+    outdir,
+    "Top20_DMRs_standardised.csv"
+  )
+)
+
+fwrite(
+  top20_probe_mapping,
+  file.path(
+    outdir,
+    "Top20_DMR_actual_DMRcate_probe_mapping_standardised.csv"
+  )
+)
+
+fwrite(
+  top20_probe_mapping_summary,
+  file.path(
+    outdir,
+    "Top20_DMR_actual_DMRcate_probe_count_summary.csv"
+  )
+)
+
+fwrite(
+  probe_common_cpg_check,
+  file.path(
+    outdir,
+    "Top20_DMR_probe_common_CpG_check.csv"
+  )
+)
+```
+
+These files document exactly which DMRs and CpGs entered the analysis.
+
+# 38. Export probe-prioritisation results
+
+The full dataset-level calculations and final consensus rankings are saved below.
+
+```{r export-probe-prioritisation-results}
+fwrite(
+  dataset_probe_results,
+  file.path(
+    outdir,
+    "Top20_DMR_probe_representativeness_by_discovery_dataset.csv"
+  )
+)
+
+fwrite(
+  consensus_probe_results,
+  file.path(
+    outdir,
+    "Top20_DMR_probe_consensus_ranking_across_discovery_datasets.csv"
+  )
+)
+
+fwrite(
+  selected_probes,
+  file.path(
+    outdir,
+    "Top20_DMR_representative_probe_rank1_across_discovery_datasets.csv"
+  )
+)
+
+fwrite(
+  top3_representative_probes,
+  file.path(
+    outdir,
+    "Top20_DMR_representative_probe_top3_across_discovery_datasets.csv"
+  )
+)
+
+fwrite(
+  selected_probe_dataset_check,
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_dataset_specific_check.csv"
+  )
+)
+```
+
+The rank-1 file is the main statistical result, while the Top 3 file supplies assay-design alternatives.
+
+# 39. Export sample-level supporting values
+
+The exact sample-level values used in the correlation analysis are retained for reproducibility.
+
+```{r export-sample-level-results}
+fwrite(
+  dmr_sample_mean_beta,
+  file.path(
+    outdir,
+    "Top20_DMR_sample_level_mean_beta_by_discovery_dataset.csv"
+  )
+)
+
+fwrite(
+  sample_level_probe_results,
+  file.path(
+    outdir,
+    "Top20_DMR_all_probe_sample_level_values.csv"
+  )
+)
+
+fwrite(
+  selected_probe_sample_results,
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_sample_level_values.csv"
+  )
+)
+```
+
+These tables allow the correlations and scatterplots to be reconstructed without repeating the complete analysis.
+
+# 40. Save summary plots
+
+The consensus plot and heatmap are saved in both PNG and PDF formats.
+
+```{r save-consensus-correlation-plot}
+ggsave(
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_consensus_correlations.png"
+  ),
+  plot = p_consensus_correlation,
+  width = 11,
+  height = 9,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_consensus_correlations.pdf"
+  ),
+  plot = p_consensus_correlation,
+  width = 11,
+  height = 9
+)
+```
+
+The consensus plot summarises the magnitude and range of each selected probe's correlations.
+
+```{r save-selected-probe-heatmap}
+ggsave(
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_dataset_correlation_heatmap.png"
+  ),
+  plot = p_selected_probe_heatmap,
+  width = 9,
+  height = 10,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    outdir,
+    "Top20_DMR_selected_probe_dataset_correlation_heatmap.pdf"
+  ),
+  plot = p_selected_probe_heatmap,
+  width = 9,
+  height = 10
+)
+```
+
+The heatmap highlights probes whose representativeness is consistent across all three discovery datasets.
+
+# 41. Save analysis objects
+
+All principal inputs, calculations, selections, and plots are saved for later review.
+
+```{r save-analysis-objects}
+save(
+  g1,
+  g2,
+  g3,
+  pd1,
+  pd2,
+  pd3,
+  common_cpg,
+  top20_dmrs_raw,
+  dmr_probe_mapping_raw,
+  probe_audit_raw,
+  top20_dmrs,
+  top20_probe_mapping,
+  top20_probe_mapping_summary,
+  discovery_dataset_summary,
+  probe_common_cpg_check,
+  dataset_probe_results,
+  sample_level_probe_results,
+  dmr_sample_mean_beta,
+  consensus_probe_results,
+  selected_probes,
+  top3_representative_probes,
+  selected_probe_dataset_check,
+  selected_probe_sample_results,
+  p_consensus_correlation,
+  p_selected_probe_heatmap,
+  file = file.path(
+    outdir,
+    "step7_Top20_probe_prioritisation_across_discovery_datasets.Rdata"
+  )
+)
+```
+
+The saved RData allows the final tables and summary plots to be reopened without repeating the full workflow.
+
+# 42. Session information
+
+The R version and package dependencies are listed at the end of the report.
+
+```{r session-information}
+sessionInfo()
+```
